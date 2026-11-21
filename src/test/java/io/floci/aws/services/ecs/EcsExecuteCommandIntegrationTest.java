@@ -1,5 +1,6 @@
 package io.floci.aws.services.ecs;
 
+import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.RestAssured;
@@ -11,8 +12,10 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.net.URI;
+import java.time.Duration;
 import java.util.List;
 
+import static io.floci.aws.testing.EcsTaskWaits.awaitLastStatus;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
@@ -38,7 +41,7 @@ class EcsExecuteCommandIntegrationTest {
     private static final String CLUSTER = "exec-cluster";
     private static final String NETWORK =
             "\"networkConfiguration\":{\"awsvpcConfiguration\":{\"subnets\":"
-                    + "[\"subnet-default-us-east-1-a\"]}}";
+                    + "[\"" + Ec2Service.defaultSubnetId("us-east-1", "a") + "\"]}}";
 
     @BeforeAll
     static void configure() {
@@ -59,10 +62,15 @@ class EcsExecuteCommandIntegrationTest {
                 + "\"requiresCompatibilities\":[\"FARGATE\"],\"networkMode\":\"awsvpc\","
                 + "\"cpu\":\"256\",\"memory\":\"512\",\"containerDefinitions\":"
                 + "[{\"name\":\"app\",\"image\":\"nginx:latest\"}]}", 200);
-        return call("RunTask", "{\"cluster\":\"" + CLUSTER + "\",\"taskDefinition\":\"" + family
+        String taskArn = call("RunTask", "{\"cluster\":\"" + CLUSTER + "\",\"taskDefinition\":\"" + family
                 + "\",\"launchType\":\"FARGATE\"," + NETWORK + ",\"enableExecuteCommand\":"
                 + enableExecuteCommand + "}", 200)
                 .jsonPath().getString("tasks[0].taskArn");
+        // RunTask answers before the launch; the task reaches RUNNING in the background.
+        awaitLastStatus(
+                () -> call("DescribeTasks", "{\"cluster\":\"" + CLUSTER + "\",\"tasks\":[\"" + taskArn + "\"]}", 200),
+                r -> r.jsonPath().getString("tasks[0].lastStatus"), Duration.ofSeconds(10), "RUNNING");
+        return taskArn;
     }
 
     @ParameterizedTest

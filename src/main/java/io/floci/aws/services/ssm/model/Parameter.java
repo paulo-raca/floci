@@ -5,6 +5,7 @@ import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.JsonNode;
+import io.floci.aws.core.common.AwsArnUtils;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
@@ -58,7 +59,7 @@ public class Parameter {
 
     @JsonProperty("Tags")
     @JsonAlias({"tags", "Tags"})
-    private Map<String, String> tags = new HashMap<>();
+    private volatile Map<String, String> tags = new HashMap<>();
 
     // The SecureString value as KMS encrypted it on PutParameter, returned by a read without WithDecryption.
     @JsonProperty("EncryptedValue")
@@ -103,7 +104,17 @@ public class Parameter {
     public String getDescription() { return description; }
     public void setDescription(String description) { this.description = description; }
 
-    public String getArn() { return arn; }
+    public String getArn() {
+        // Retained flat-name records written before the ARN fix lack the resource separator.
+        if (name != null && !name.startsWith("/") && AwsArnUtils.isArnFor(arn, "ssm")) {
+            AwsArnUtils.Arn stored = AwsArnUtils.parse(arn);
+            if (stored.resource().equals("parameter" + name)) {
+                return new AwsArnUtils.Arn(stored.partition(), stored.service(), stored.region(),
+                        stored.accountId(), "parameter/" + name).toString();
+            }
+        }
+        return arn;
+    }
     public void setArn(String arn) { this.arn = arn; }
 
     public String getDataType() { return dataType; }

@@ -398,6 +398,29 @@ class IamServiceLinkedRoleIntegrationTest {
                             + " pattern: [\\w+=.@-]*"));
     }
 
+    /**
+     * A comma is admitted, which is the half of this member's drift the capture did not settle:
+     * AWS's own message quotes {@code [\w+=.@-]*} without one and the pattern AWS publishes for the
+     * member carries it. Why the published pattern is what a value is held to here is in
+     * {@code docs/services/iam.md} rather than repeated. What this pins is where a comma lands: the
+     * shape takes it and the lookup derives the role name, the answer any service no recording
+     * covers gets, which is what {@link #aServiceTheRecordingsDoNotCoverStillTakesASuffix} pins.
+     */
+    @Test
+    @Order(34)
+    void aPrincipalWithACommaIsHeldToThePatternAwsPublishes() {
+        given()
+            .formParam("Action", "CreateServiceLinkedRole")
+            .formParam("AWSServiceName", "commaprobe,test.amazonaws.com")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("CreateServiceLinkedRoleResponse.CreateServiceLinkedRoleResult.Role.RoleName",
+                    equalTo("AWSServiceRoleForCommaprobe,test"));
+    }
+
     @Test
     @Order(15)
     void aServiceNameLongerThanTheDocumentedMaximumIsRejected() {
@@ -619,6 +642,32 @@ class IamServiceLinkedRoleIntegrationTest {
             .post("/")
         .then()
             .statusCode(404);
+    }
+
+    /**
+     * The sentence AWS was recorded answering for the one change this package guards on
+     * {@code UpdateRole}, with the role's own name and the rest fixed. The other actions guarded
+     * here carry no recording of their own and keep this emulator's sentence, which is why only
+     * this one is held to a message.
+     */
+    @Test
+    @Order(35)
+    void theDurationRefusalCarriesTheRecordedSentence() {
+        createServiceLinkedRole("wordingprobe.amazonaws.com");
+        String roleName = "AWSServiceRoleForWordingprobe";
+
+        given()
+            .formParam("Action", "UpdateRole")
+            .formParam("RoleName", roleName)
+            .formParam("MaxSessionDuration", "7200")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("ErrorResponse.Error.Code", equalTo("UnmodifiableEntity"))
+            .body("ErrorResponse.Error.Message", equalTo(roleName
+                    + " is an AWS service linked role, max session duration cannot be changed."));
     }
 
     private static void refusedAsUnmodifiable(String action, String... formParams) {

@@ -1,8 +1,12 @@
 package io.floci.aws.services.scheduler;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.InMemoryStorage;
+import io.floci.aws.core.storage.PersistentStorage;
 import io.floci.aws.services.scheduler.model.DeadLetterConfig;
 import io.floci.aws.services.scheduler.model.FlexibleTimeWindow;
 import io.floci.aws.services.scheduler.model.RetryPolicy;
@@ -12,10 +16,14 @@ import io.floci.aws.services.scheduler.model.ScheduleRequest;
 import io.floci.aws.services.scheduler.model.Target;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -45,6 +53,152 @@ class SchedulerServiceTest {
         return req;
     }
 
+
+    private Schedule createRateSchedule(SchedulerService schedulers, String name) {
+        return schedulers.createSchedule(newRequest(name, null, "rate(1 hour)", new FlexibleTimeWindow("OFF", null),
+                new Target("arn:t", "arn:aws:iam::000000000000:role/r", null, null)), REGION);
+    }
+
+    @Test
+    void aRecordedFireIsKeptByAnUpdate() {
+        Schedule created = createRateSchedule(service, "fired");
+        Instant firedAt = Instant.parse("2026-04-21T12:00:00Z");
+
+        service.recordFire(created, REGION, firedAt);
+        service.updateSchedule(newRequest("fired", null, "rate(2 hours)", new FlexibleTimeWindow("OFF", null),
+                new Target("arn:t", "arn:aws:iam::000000000000:role/r", null, null)), REGION);
+
+        assertEquals(firedAt, service.getSchedule("fired", null, REGION).getLastFiredAt());
+    }
+
+    // Catches: the dispatcher's record of a fire bringing back a schedule deleted while it fired, or
+    // marking a new schedule created under the same name as already fired.
+    @Test
+    void aFireIsNotRecordedOnADeletedOrRecreatedSchedule() {
+        Schedule created = createRateSchedule(service, "gone");
+        service.deleteSchedule("gone", null, REGION);
+
+        service.recordFire(created, REGION, Instant.parse("2026-04-21T12:00:00Z"));
+        assertThrows(AwsException.class, () -> service.getSchedule("gone", null, REGION));
+
+        Schedule recreated = createRateSchedule(service, "gone");
+        created.setCreationDate(recreated.getCreationDate().minusSeconds(60));
+        service.recordFire(created, REGION, Instant.parse("2026-04-21T12:00:00Z"));
+        assertNull(service.getSchedule("gone", null, REGION).getLastFiredAt());
+    }
+
+    // Catches: a fire recorded while a group delete cascades through its schedules writing one back,
+    // so it lived on in a deleted group and kept firing. The delete holds the lock until it is done.
+    @Test
+    void aFireIsNotRecordedWhileItsGroupIsBeingDeleted() throws Exception {
+        CountDownLatch deleting = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        InMemoryStorage<String, Schedule> schedules = new InMemoryStorage<>() {
+            @Override
+            public void delete(String key) {
+                deleting.countDown();
+                try {
+                    release.await(5, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                super.delete(key);
+            }
+        };
+        SchedulerService schedulers = new SchedulerService(new InMemoryStorage<>(), schedules,
+                new RegionResolver(REGION, "000000000000"));
+        schedulers.createScheduleGroup("team", Map.of(), REGION);
+        Schedule created = schedulers.createSchedule(newRequest("in-group", "team", "rate(1 hour)",
+                new FlexibleTimeWindow("OFF", null),
+                new Target("arn:t", "arn:aws:iam::000000000000:role/r", null, null)), REGION);
+
+        Thread groupDelete = Thread.ofPlatform().start(() -> schedulers.deleteScheduleGroup("team", REGION));
+        assertTrue(deleting.await(5, TimeUnit.SECONDS), "the cascade should reach the schedule");
+        Thread fire = Thread.ofPlatform().start(
+                () -> schedulers.recordFire(created, REGION, Instant.parse("2026-04-21T12:00:00Z")));
+        // Without the lock the fire runs to completion here instead of parking on the service's monitor.
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (fire.getState() != Thread.State.BLOCKED && fire.isAlive() && System.nanoTime() < deadline) {
+            Thread.sleep(5);
+        }
+        assertEquals(Thread.State.BLOCKED, fire.getState(), "recording a fire should wait for the delete");
+        release.countDown();
+        groupDelete.join();
+        fire.join();
+
+        assertTrue(schedules.scan(key -> true).isEmpty(), "the deleted group's schedule must stay deleted");
+    }
+
+    // Catches BL-385 across a real restart: the last fire written to disk is there when the stores are
+    // read back, so the dispatcher neither re-fires a one-time schedule nor catches a recurring one up.
+    @Test
+    void aRecordedFireSurvivesAReloadFromDisk(@TempDir Path dir) {
+        Path groups = dir.resolve("scheduler-groups.json");
+        Path schedules = dir.resolve("scheduler-schedules.json");
+        SchedulerService before = new SchedulerService(
+                new PersistentStorage<>(groups, new TypeReference<Map<String, ScheduleGroup>>() { }),
+                new PersistentStorage<>(schedules, new TypeReference<Map<String, Schedule>>() { }),
+                new RegionResolver(REGION, "000000000000"));
+        Schedule created = createRateSchedule(before, "durable");
+        Instant firedAt = Instant.parse("2026-04-21T12:00:00Z");
+        before.recordFire(created, REGION, firedAt);
+
+        PersistentStorage<String, ScheduleGroup> groupStore =
+                new PersistentStorage<>(groups, new TypeReference<Map<String, ScheduleGroup>>() { });
+        PersistentStorage<String, Schedule> scheduleStore =
+                new PersistentStorage<>(schedules, new TypeReference<Map<String, Schedule>>() { });
+        groupStore.load();
+        scheduleStore.load();
+        SchedulerService after = new SchedulerService(groupStore, scheduleStore,
+                new RegionResolver(REGION, "000000000000"));
+
+        assertEquals(firedAt, after.getSchedule("durable", null, REGION).getLastFiredAt());
+    }
+
+    /**
+     * Tagging and untagging put a new map in place of the group's, never changing the one a tag lookup may be
+     * copying, so a lookup during either reads one whole set.
+     */
+    @Test
+    void taggingReplacesTheGroupsTagsAndLeavesTheOldSetWhole() {
+        ScheduleGroup group = service.createScheduleGroup("tags", Map.of("team", "data"), REGION);
+        Map<String, String> before = group.getTags();
+
+        service.tagScheduleGroup("tags", REGION, Map.of("owner", "alice"));
+        Map<String, String> tagged = service.getScheduleGroup("tags", REGION).getTags();
+        service.untagScheduleGroup("tags", REGION, List.of("team"));
+
+        assertEquals(Map.of("team", "data"), before);
+        assertEquals(Map.of("team", "data", "owner", "alice"), tagged);
+        assertEquals(Map.of("owner", "alice"), service.getScheduleGroup("tags", REGION).getTags());
+    }
+
+    /**
+     * The tags IAM gives a resource-tag condition: the schedule group's, read on its whole ARN in the account and
+     * Region it names, a pre-multi-account entry of the default account in place; none for anything else, the default
+     * group before a request stores it among them.
+     */
+    @Test
+    void storedTagsReadsTheScheduleGroupItsArnNames() {
+        InMemoryStorage<String, ScheduleGroup> raw = new InMemoryStorage<>();
+        SchedulerService accounts = new SchedulerService(new AccountAwareStorageBackend<>(raw, null, "000000000000"),
+                new InMemoryStorage<>(), new RegionResolver(REGION, "000000000000"));
+        ScheduleGroup group = accounts.createScheduleGroup("tagged", Map.of("team", "data"), REGION);
+
+        assertEquals(Map.of("team", "data"), accounts.storedTags(group.getArn()));
+        assertEquals(Map.of(), accounts.storedTags(group.getArn().replace(":000000000000:", ":111122223333:")));
+        assertEquals(Map.of(), accounts.storedTags(group.getArn().replace(REGION, "eu-west-1")));
+        String schedule = group.getArn().replace("schedule-group/tagged", "schedule/tagged/s");
+        assertEquals(Map.of(), accounts.storedTags(schedule));
+        assertEquals(Map.of(), accounts.storedTags(accounts.findDefault("schedule-group", REGION).orElseThrow()));
+
+        String legacyArn = group.getArn().replace("tagged", "legacy");
+        ScheduleGroup legacy = new ScheduleGroup("legacy", legacyArn, "ACTIVE", Instant.now(), Instant.now());
+        legacy.getTags().put("team", "old");
+        raw.put("group:" + REGION + ":legacy", legacy);
+        assertEquals(Map.of("team", "old"), accounts.storedTags(legacyArn));
+        assertTrue(raw.get("group:" + REGION + ":legacy").isPresent());
+    }
     @Test
     void getOrCreateDefaultGroup() {
         ScheduleGroup group = service.getOrCreateDefaultGroup(REGION);
@@ -724,6 +878,112 @@ class SchedulerServiceTest {
         List<Schedule> result = service.listSchedules(null, null, "DISABLED", REGION);
         assertEquals(1, result.size());
         assertEquals("disabled-1", result.get(0).getName());
+    }
+
+    @Test
+    void listScheduleGroupsPagesWithNextToken() {
+        service.createScheduleGroup("page-a", null, REGION);
+        service.createScheduleGroup("page-b", null, REGION);
+
+        PaginatedResult<ScheduleGroup> first = service.listScheduleGroups("page-", 1, null, REGION);
+        assertEquals(List.of("page-a"), first.items().stream().map(ScheduleGroup::getName).toList());
+        assertNotNull(first.nextToken());
+
+        PaginatedResult<ScheduleGroup> second = service.listScheduleGroups("page-", 1, first.nextToken(), REGION);
+        assertEquals(List.of("page-b"), second.items().stream().map(ScheduleGroup::getName).toList());
+        assertNull(second.nextToken());
+    }
+
+    @Test
+    void listSchedulesPagesWithinGroupAndState() {
+        service.createScheduleGroup("paged", null, REGION);
+        for (String name : List.of("p-1", "p-2", "p-3")) {
+            ScheduleRequest req = newRequest(name, "paged", "rate(1 hour)",
+                    new FlexibleTimeWindow("OFF", null),
+                    new Target("arn:t", "arn:aws:iam::000000000000:role/r", null, null));
+            req.setState("p-2".equals(name) ? "DISABLED" : "ENABLED");
+            service.createSchedule(req, REGION);
+        }
+
+        PaginatedResult<Schedule> first = service.listSchedules("paged", "p-", "ENABLED", 1, null, REGION);
+        assertEquals(List.of("p-1"), first.items().stream().map(Schedule::getName).toList());
+        assertNotNull(first.nextToken());
+
+        PaginatedResult<Schedule> second = service.listSchedules("paged", "p-", "ENABLED", 1,
+                first.nextToken(), REGION);
+        assertEquals(List.of("p-3"), second.items().stream().map(Schedule::getName).toList());
+        assertNull(second.nextToken());
+    }
+
+    @Test
+    void listSchedulesPagesAcrossGroups() {
+        service.createScheduleGroup("g-a", null, REGION);
+        service.createScheduleGroup("g-b", null, REGION);
+        for (String group : List.of("g-a", "g-b")) {
+            service.createSchedule(newRequest("same", group, "rate(1 hour)",
+                    new FlexibleTimeWindow("OFF", null),
+                    new Target("arn:t", "arn:aws:iam::000000000000:role/r", null, null)), REGION);
+        }
+
+        PaginatedResult<Schedule> first = service.listSchedules(null, null, null, 1, null, REGION);
+        PaginatedResult<Schedule> second = service.listSchedules(null, null, null, 1, first.nextToken(), REGION);
+        assertEquals("g-a", first.items().get(0).getGroupName());
+        assertEquals("g-b", second.items().get(0).getGroupName());
+        assertNull(second.nextToken());
+    }
+
+    @Test
+    void listOperationsRejectOutOfRangeMaxResults() {
+        for (Integer maxResults : List.of(0, 101)) {
+            AwsException groups = assertThrows(AwsException.class, () ->
+                    service.listScheduleGroups(null, maxResults, null, REGION));
+            assertEquals("ValidationException", groups.getErrorCode());
+            assertEquals(400, groups.getHttpStatus());
+            AwsException schedules = assertThrows(AwsException.class, () ->
+                    service.listSchedules(null, null, null, maxResults, null, REGION));
+            assertEquals("ValidationException", schedules.getErrorCode());
+        }
+    }
+
+    @Test
+    void listOperationsRejectForeignOrBogusNextToken() {
+        service.createScheduleGroup("tok-a", null, REGION);
+        service.createScheduleGroup("tok-b", null, REGION);
+        String groupToken = service.listScheduleGroups(null, 1, null, REGION).nextToken();
+
+        AwsException bogus = assertThrows(AwsException.class, () ->
+                service.listScheduleGroups(null, 1, "not-a-token", REGION));
+        assertEquals("ValidationException", bogus.getErrorCode());
+        assertEquals(400, bogus.getHttpStatus());
+        AwsException foreign = assertThrows(AwsException.class, () ->
+                service.listSchedules(null, null, null, 1, groupToken, REGION));
+        assertEquals("ValidationException", foreign.getErrorCode());
+        AwsException emptyGroups = assertThrows(AwsException.class, () ->
+                service.listScheduleGroups(null, 1, "", REGION));
+        assertEquals("ValidationException", emptyGroups.getErrorCode());
+        assertEquals(400, emptyGroups.getHttpStatus());
+        assertEquals("Pagination token must be between 1 and 2048 characters.", emptyGroups.getMessage());
+        AwsException emptySchedules = assertThrows(AwsException.class, () ->
+                service.listSchedules(null, null, null, 1, "", REGION));
+        assertEquals("ValidationException", emptySchedules.getErrorCode());
+        assertEquals(400, emptySchedules.getHttpStatus());
+        assertEquals("Pagination token must be between 1 and 2048 characters.", emptySchedules.getMessage());
+    }
+
+    @Test
+    void listOperationsRejectOverLengthNextToken() {
+        String overLength = "x".repeat(2049);
+
+        AwsException groups = assertThrows(AwsException.class, () ->
+                service.listScheduleGroups(null, 1, overLength, REGION));
+        assertEquals("ValidationException", groups.getErrorCode());
+        assertEquals(400, groups.getHttpStatus());
+        assertEquals("Pagination token must not exceed 2048 characters.", groups.getMessage());
+        AwsException schedules = assertThrows(AwsException.class, () ->
+                service.listSchedules(null, null, null, 1, overLength, REGION));
+        assertEquals("ValidationException", schedules.getErrorCode());
+        assertEquals(400, schedules.getHttpStatus());
+        assertEquals("Pagination token must not exceed 2048 characters.", schedules.getMessage());
     }
 
     @Test

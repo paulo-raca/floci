@@ -10,6 +10,7 @@ import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.ServicePrincipals;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
+import io.floci.aws.services.iam.PrincipalOrganization;
 import io.floci.aws.services.iam.RootAccessOrganization;
 import io.floci.aws.services.iam.ScpProvider;
 import io.floci.aws.services.organizations.model.CreateAccountStatus;
@@ -23,6 +24,7 @@ import io.floci.aws.services.organizations.model.OrganizationalUnit;
 import io.floci.aws.services.organizations.model.PolicyTypeSummary;
 import io.floci.aws.services.organizations.model.Root;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -59,7 +61,8 @@ import java.util.regex.Pattern;
  * @see <a href="https://docs.aws.amazon.com/organizations/latest/APIReference/Welcome.html">AWS Organizations API Reference</a>
  */
 @ApplicationScoped
-public class OrganizationsService implements ScpProvider, RootAccessOrganization {
+public class OrganizationsService implements ScpProvider, RootAccessOrganization,
+        PrincipalOrganization {
 
     private static final Logger LOG = Logger.getLogger(OrganizationsService.class);
 
@@ -172,11 +175,13 @@ public class OrganizationsService implements ScpProvider, RootAccessOrganization
     private final boolean scpEnforcementEnabled;
     private final String managementAccountEmail;
     private final AccountAccessRoleProvisioner accountAccessRoleProvisioner;
+    private final Iterable<AccountPlacementListener> placementListeners;
 
     @Inject
     public OrganizationsService(StorageFactory storageFactory, ObjectMapper objectMapper,
                                 EmulatorConfig config, RegionResolver regionResolver,
-                                AccountAccessRoleProvisioner accountAccessRoleProvisioner) {
+                                AccountAccessRoleProvisioner accountAccessRoleProvisioner,
+                                Instance<AccountPlacementListener> placementListeners) {
         EmulatorConfig.OrganizationsServiceConfig organizationsConfig = config.services().organizations();
         this.scpEnforcementEnabled = organizationsConfig.scpEnforcementEnabled();
         this.managementAccountEmail = organizationsConfig.managementAccountEmail()
@@ -185,6 +190,7 @@ public class OrganizationsService implements ScpProvider, RootAccessOrganization
         this.objectMapper = objectMapper;
         this.regionResolver = regionResolver;
         this.accountAccessRoleProvisioner = accountAccessRoleProvisioner;
+        this.placementListeners = placementListeners;
         this.organizations = storageFactory.create("organizations", "organizations-organizations.json",
                 new TypeReference<Map<String, Organization>>() {});
         this.accounts = storageFactory.create("organizations", "organizations-accounts.json",
@@ -263,6 +269,7 @@ public class OrganizationsService implements ScpProvider, RootAccessOrganization
                 ? null
                 : requireValidConfiguredEmail(managementAccountEmail);
         this.accountAccessRoleProvisioner = accountAccessRoleProvisioner;
+        this.placementListeners = List.of();
     }
 
     /** A parent reference as returned by {@code ListParents}. */
@@ -655,7 +662,18 @@ public class OrganizationsService implements ScpProvider, RootAccessOrganization
         createAccountStatuses.putForAccount(organization.getMasterAccountId(), status.getId(), status);
 
         LOG.infov("Created account {0} ({1}) in organization {2}", newAccountId, accountName, organization.getId());
+        placementChanged(organization, newAccountId);
         return status;
+    }
+
+    private void placementChanged(Organization organization, String accountId) {
+        for (AccountPlacementListener listener : placementListeners) {
+            try {
+                listener.accountPlacementChanged(organization.getMasterAccountId(), accountId);
+            } catch (RuntimeException e) {
+                LOG.warnv(e, "Account placement notification failed for account {0}", accountId);
+            }
+        }
     }
 
     public CreateAccountStatus describeCreateAccountStatus(String callerAccountId, String requestId) {
@@ -678,7 +696,21 @@ public class OrganizationsService implements ScpProvider, RootAccessOrganization
         return requireAccount(requireOrganizationForCaller(callerAccountId), accountId);
     }
 
-    public Optional<OrganizationAccount> findAccountForPortal(String accountId) {
+    /**
+     * Renames an account in the organization that holds it, as Account Management's {@code PutAccountName} does,
+     * so {@code DescribeAccount} and {@code ListAccounts} answer the new name. Does nothing for an account in no
+     * organization.
+     */
+    public void renameAccount(String accountId, String name) {
+        findOrganizationForAccount(accountId).ifPresent(organization -> accountIn(organization, accountId)
+                .ifPresent(account -> {
+                    account.setName(name);
+                    accounts.putForAccount(organization.getMasterAccountId(), accountId, account);
+                }));
+    }
+
+    /** The record of an account in the organization that holds it, empty for an account in no organization. */
+    public Optional<OrganizationAccount> findAccount(String accountId) {
         if (accountId == null || !ACCOUNT_ID_PATTERN.matcher(accountId).matches()) {
             return Optional.empty();
         }
@@ -722,6 +754,7 @@ public class OrganizationsService implements ScpProvider, RootAccessOrganization
         }
         account.setParentId(destinationParentId);
         accounts.putForAccount(organization.getMasterAccountId(), accountId, account);
+        placementChanged(organization, accountId);
     }
 
     public void removeAccountFromOrganization(String callerAccountId, String accountId) {
@@ -733,6 +766,7 @@ public class OrganizationsService implements ScpProvider, RootAccessOrganization
         }
         detachAllPoliciesFrom(organization, account.getId());
         accounts.deleteForAccount(organization.getMasterAccountId(), account.getId());
+        placementChanged(organization, account.getId());
     }
 
     public void leaveOrganization(String callerAccountId) {
@@ -744,6 +778,7 @@ public class OrganizationsService implements ScpProvider, RootAccessOrganization
         OrganizationAccount account = requireAccount(organization, callerAccountId);
         detachAllPoliciesFrom(organization, account.getId());
         accounts.deleteForAccount(organization.getMasterAccountId(), account.getId());
+        placementChanged(organization, account.getId());
     }
 
     public OrganizationAccount closeAccount(String callerAccountId, String accountId) {
@@ -1103,6 +1138,65 @@ public class OrganizationsService implements ScpProvider, RootAccessOrganization
         return levels.isEmpty() ? null : levels;
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Answered for any account the organization holds, the management account included: it is
+     * a member of its own organization, so its principals carry the keys too. The lookup is not
+     * scoped to a caller, the account asked about being the one a policy is evaluated for rather
+     * than the one that called.</p>
+     *
+     * <p>It is read on the authorization path, so it reads as little as it can: an emulator
+     * holding no organization at all answers from the store's own emptiness, and an account that
+     * is in one is found once and carries its own parent into the path rather than being looked
+     * up again.</p>
+     */
+    @Override
+    public Optional<OrganizationContext> organizationContextOf(String accountId) {
+        if (accountId == null || accountId.isBlank() || organizations.isEmptyInAllAccounts()) {
+            return Optional.empty();
+        }
+        OrganizationAccount member = accounts.scanAllAccounts().stream()
+                .filter(account -> accountId.equals(account.getId()))
+                .findFirst()
+                .orElse(null);
+        Optional<Organization> organization = member == null
+                ? organizationManagedBy(accountId)
+                : organizationById(member.getOrganizationId());
+        return organization.map(found -> new OrganizationContext(
+                found.getId(), found.getMasterAccountId(), parentPath(found, member)));
+    }
+
+    /** The organization this account manages, which is the one holding no member row for it. */
+    private Optional<Organization> organizationManagedBy(String accountId) {
+        return organizations.scanAllAccounts().stream()
+                .filter(organization -> accountId.equals(organization.getMasterAccountId()))
+                .findFirst();
+    }
+
+    /**
+     * The path an account's principals carry, which stops at the account's parent rather than at
+     * the account: the published condition for the key compares a path ending in an OU. An
+     * account the organization holds no row for is at its root, which is where the management
+     * account sits.
+     *
+     * <p>A chain that cannot be walked, an account naming a parent the organization no longer
+     * holds, is no path rather than a failed call: the caller asked for an authorization decision,
+     * and a key with no value is answered by every condition written on it. {@link
+     * #effectiveScpLevels} answers an organization it cannot resolve the same way.
+     */
+    private String parentPath(Organization organization, OrganizationAccount member) {
+        String rootId = organization.getRoot().getId();
+        String parentId = member == null || member.getParentId() == null || member.getParentId().isBlank()
+                ? rootId : member.getParentId();
+        try {
+            return organizationPath(organization.getId(), rootId, parentId,
+                    id -> parentOf(organization, id));
+        } catch (AwsException e) {
+            return null;
+        }
+    }
+
     // ──────────────────────────── Tags ────────────────────────────
 
     public Map<String, String> listTagsForResource(String callerAccountId, String resourceId) {
@@ -1230,17 +1324,16 @@ public class OrganizationsService implements ScpProvider, RootAccessOrganization
             organization.setResourcePolicyId(policyId);
             organization.setResourcePolicyArn(
                     arn(organization.getMasterAccountId(), "resourcepolicy/" + organization.getId() + "/" + policyId));
+            if (tags != null) {
+                organization.getResourcePolicyTags().putAll(tags);
+            }
+        } else if (tags != null && !tags.isEmpty()) {
+            // The model says Tags apply only when this call creates the policy and that it throws
+            // otherwise, without naming the error. An empty list has no tags to apply.
+            throw invalidInput("Tags apply only to the initial creation of the resource policy."
+                    + " Use TagResource and UntagResource to change its tags.");
         }
         organization.setResourcePolicyContent(content);
-        if (tags != null) {
-            // Put replaces rather than merges: a caller that supplies Tags is stating the full set,
-            // so a key it no longer lists is dropped. The resource policy is not addressable by
-            // TagResource/UntagResource the way accounts, OUs, roots and policies are, so this call
-            // is the only way CloudFormation can converge Tags on an update. Omitting Tags
-            // entirely (null) leaves the existing ones untouched.
-            organization.getResourcePolicyTags().clear();
-            organization.getResourcePolicyTags().putAll(tags);
-        }
         organizations.putForAccount(organization.getMasterAccountId(), organization.getId(), organization);
         return resourcePolicyView(organization);
     }
@@ -1270,7 +1363,7 @@ public class OrganizationsService implements ScpProvider, RootAccessOrganization
     // ──────────────────────────── Handshakes ────────────────────────────
 
     public Handshake inviteAccountToOrganization(String callerAccountId, String targetId, String targetType,
-                                                 String notes) {
+                                                 String notes, Map<String, String> tags) {
         Organization organization = requireManagementAccount(callerAccountId);
         if (targetId == null || targetId.isEmpty()) {
             throw invalidInput("Target.Id is required.");
@@ -1279,6 +1372,7 @@ public class OrganizationsService implements ScpProvider, RootAccessOrganization
         if (!"ACCOUNT".equals(resolvedType) && !"EMAIL".equals(resolvedType)) {
             throw invalidInput("Target.Type must be ACCOUNT or EMAIL.");
         }
+        validateTags(tags);
 
         String invitedAccountId = null;
         String invitedEmail = null;
@@ -1315,6 +1409,9 @@ public class OrganizationsService implements ScpProvider, RootAccessOrganization
         Handshake handshake = newHandshake(organization, HANDSHAKE_INVITE);
         handshake.setTargetAccountId(invitedAccountId);
         handshake.setTargetEmail(invitedEmail);
+        if (tags != null) {
+            handshake.getTags().putAll(tags);
+        }
         handshake.getParties().add(new HandshakeParty(organization.getId(), "ORGANIZATION"));
         handshake.getParties().add(new HandshakeParty(targetId, resolvedType));
 
@@ -1359,6 +1456,7 @@ public class OrganizationsService implements ScpProvider, RootAccessOrganization
                     : "account-" + callerAccountId + "@example.com";
             OrganizationAccount account = newMemberAccount(
                     organization, callerAccountId, email, "invited-" + callerAccountId, "INVITED");
+            account.getTags().putAll(handshake.getTags());
             accounts.putForAccount(organization.getMasterAccountId(), callerAccountId, account);
             attachFullAwsAccess(organization, callerAccountId);
             handshake.setTargetAccountId(callerAccountId);
@@ -1366,6 +1464,9 @@ public class OrganizationsService implements ScpProvider, RootAccessOrganization
 
         handshake.setState(HANDSHAKE_ACCEPTED);
         handshakes.putForAccount(organization.getMasterAccountId(), handshakeId, handshake);
+        if (!HANDSHAKE_ENABLE_ALL_FEATURES.equals(handshake.getAction())) {
+            placementChanged(organization, callerAccountId);
+        }
         return handshake;
     }
 
@@ -1567,6 +1668,12 @@ public class OrganizationsService implements ScpProvider, RootAccessOrganization
                 .toList();
     }
 
+    private Optional<OrganizationAccount> accountIn(Organization organization, String accountId) {
+        return accountsIn(organization).stream()
+                .filter(account -> accountId.equals(account.getId()))
+                .findFirst();
+    }
+
     private List<OrganizationalUnit> organizationalUnitsIn(Organization organization) {
         return organizationalUnits.scanAllAccounts().stream()
                 .filter(ou -> organization.getId().equals(ou.getOrganizationId()))
@@ -1597,9 +1704,7 @@ public class OrganizationsService implements ScpProvider, RootAccessOrganization
         if (accountId == null || !ACCOUNT_ID_PATTERN.matcher(accountId).matches()) {
             throw invalidInput("Account id must be 12 digits.");
         }
-        return accountsIn(organization).stream()
-                .filter(account -> accountId.equals(account.getId()))
-                .findFirst()
+        return accountIn(organization, accountId)
                 .orElseThrow(() -> new AwsException("AccountNotFoundException",
                         "We can't find an AWS account with the AccountId " + accountId + ".", 400));
     }
@@ -1778,6 +1883,10 @@ public class OrganizationsService implements ScpProvider, RootAccessOrganization
             OrganizationPolicy policy = requirePolicy(organization, resourceId);
             return new TagOwner(policy.getTags(),
                     () -> policies.putForAccount(master, resourceId, policy));
+        }
+        if (resourceId.equals(organization.getResourcePolicyId())) {
+            return new TagOwner(organization.getResourcePolicyTags(),
+                    () -> organizations.putForAccount(master, organization.getId(), organization));
         }
         throw new AwsException("TargetNotFoundException",
                 "We can't find a resource with the ResourceId " + resourceId + ".", 400);

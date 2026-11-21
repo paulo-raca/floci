@@ -1,9 +1,12 @@
 package io.floci.aws.services.ec2;
 
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.AvailabilityZoneIds;
+import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.services.ec2.model.GroupIdentifier;
 import io.floci.aws.services.ec2.model.Instance;
 import io.floci.aws.services.ec2.model.Tag;
+import io.floci.aws.services.ec2instanceconnect.InstanceConnectKeys;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.model.IamRole;
 import io.floci.aws.services.iam.model.InstanceProfile;
@@ -34,6 +37,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiFunction;
 
 /**
  * IMDS-compatible HTTP server bound to port 9169 on the Floci host.
@@ -65,19 +69,51 @@ public class Ec2MetadataServer {
     private final Map<String, Instance> containerIpToInstance = new ConcurrentHashMap<>();
     /** Cluster nodes whose instance-profile identity their registrar synthesizes rather than IAM holding it. */
     private final Set<Instance> synthesizedProfiles = ConcurrentHashMap.newKeySet();
+    /** The addresses of the relays that name each caller in X-Forwarded-For, which is read from them alone. */
+    private final Set<String> forwarders = ConcurrentHashMap.newKeySet();
 
     private volatile HttpServer httpServer;
+    private final InstanceConnectKeys instanceConnect;
 
     @Inject
-    public Ec2MetadataServer(Vertx vertx, EmulatorConfig config, IamService iamService) {
-        this(vertx, config, iamService, Clock.systemUTC());
+    public Ec2MetadataServer(Vertx vertx, EmulatorConfig config, IamService iamService,
+                             InstanceConnectKeys instanceConnect) {
+        this(vertx, config, iamService, Clock.systemUTC(), instanceConnect);
     }
 
     Ec2MetadataServer(Vertx vertx, EmulatorConfig config, IamService iamService, Clock clock) {
+        this(vertx, config, iamService, clock, null);
+    }
+
+    Ec2MetadataServer(Vertx vertx, EmulatorConfig config, IamService iamService, Clock clock,
+                      InstanceConnectKeys instanceConnect) {
         this.vertx = vertx;
         this.config = config;
         this.credentials = new Ec2InstanceCredentials(iamService);
         this.clock = clock;
+        this.instanceConnect = instanceConnect;
+    }
+
+    /** EC2 Instance Connect's signing material, for installing its trust anchor in guests; empty in tests. */
+    public Optional<InstanceConnectKeys> instanceConnect() {
+        return Optional.ofNullable(instanceConnect);
+    }
+
+    /**
+     * Trusts the relay at {@code address}, which holds 169.254.169.254 for containers that cannot hold it themselves and
+     * names each caller's address in {@code X-Forwarded-For}: a request from it is answered for that caller.
+     */
+    public void trustForwarder(String address) {
+        if (address != null && !address.isBlank()) {
+            forwarders.add(address);
+        }
+    }
+
+    /** Stops trusting the relay at {@code address}, which has gone. */
+    public void distrustForwarder(String address) {
+        if (address != null) {
+            forwarders.remove(address);
+        }
     }
 
     /** Called by Ec2ContainerManager after a container starts to register its IP. */
@@ -93,6 +129,14 @@ public class Ec2MetadataServer {
     public void unregisterContainer(String containerIp, Instance instance) {
         if (containerIp != null && instance != null) {
             containerIpToInstance.remove(containerIp, instance);
+        }
+    }
+
+    void rollbackContainerRegistration(String containerIp, Instance instance) {
+        containerIpToInstance.remove(containerIp, instance);
+        if (!containerIpToInstance.containsValue(instance)) {
+            credentials.unregister(instance);
+            tokens.values().removeIf(token -> token.instance() == instance);
         }
     }
 
@@ -156,10 +200,10 @@ public class Ec2MetadataServer {
         router.get("/latest/meta-data/hostname").handler(ctx -> handleText(ctx, inst -> inst.getPrivateDnsName()));
         router.get("/latest/meta-data/mac").handler(ctx -> handleMac(ctx));
         router.get("/latest/meta-data/security-groups").handler(ctx -> handleSecurityGroups(ctx));
-        router.get("/latest/meta-data/placement/availability-zone").handler(ctx -> handleText(ctx, inst ->
-                inst.getPlacement() != null
-                        ? inst.getPlacement().getAvailabilityZone()
-                        : config.defaultAvailabilityZone()));
+        router.get("/latest/meta-data/placement/availability-zone").handler(ctx -> handleText(ctx,
+                this::availabilityZone));
+        router.get("/latest/meta-data/placement/availability-zone-id").handler(ctx -> handleText(ctx, inst ->
+                AvailabilityZoneIds.forZoneName(inst.getRegion(), availabilityZone(inst))));
         router.get("/latest/meta-data/placement/region").handler(ctx -> handleText(ctx, inst -> inst.getRegion()));
         router.get("/latest/meta-data/iam/info").handler(ctx -> handleIamInfo(ctx));
         router.get("/latest/meta-data/iam/security-credentials/").handler(ctx -> handleCredentialsList(ctx));
@@ -178,6 +222,17 @@ public class Ec2MetadataServer {
         router.get("/latest/meta-data/tags/instance").handler(ctx -> handleInstanceTagKeys(ctx));
         router.get("/latest/meta-data/tags/instance/").handler(ctx -> handleInstanceTagKeys(ctx));
         router.getWithRegex("/latest/meta-data/tags/instance/.+").handler(ctx -> handleInstanceTagValue(ctx));
+        router.get("/latest/meta-data/services/domain").handler(ctx -> handleText(ctx, inst -> AwsRegions.dnsSuffixFor(inst.getRegion())));
+        // EC2 Instance Connect. The agent probes active-keys with HEAD before fetching it. Blocking
+        // handlers: the first call generates RSA key pairs and every one signs, which must not stall the event loop.
+        router.route("/latest/meta-data/managed-ssh-keys/active-keys/:user").method(HttpMethod.GET)
+                .method(HttpMethod.HEAD).blockingHandler(this::handleManagedSshKeys);
+        router.get("/latest/meta-data/managed-ssh-keys/signer-cert").blockingHandler(ctx -> handleInstanceConnect(ctx,
+                (keys, inst) -> keys.signerCertificateChain(inst.getRegion())));
+        router.get("/latest/meta-data/managed-ssh-keys/signer-ocsp").blockingHandler(ctx -> handleInstanceConnect(ctx,
+                (keys, inst) -> String.join("\n", keys.ocspStaples(inst.getRegion()).keySet())));
+        router.get("/latest/meta-data/managed-ssh-keys/signer-ocsp/:fingerprint").blockingHandler(ctx -> handleInstanceConnect(ctx,
+                (keys, inst) -> keys.ocspStaples(inst.getRegion()).get(ctx.pathParam("fingerprint"))));
         router.get("/latest/user-data").handler(ctx -> handleUserData(ctx));
         router.get("/latest/dynamic/instance-identity/document").handler(ctx -> handleIdentityDocument(ctx));
 
@@ -199,6 +254,7 @@ public class Ec2MetadataServer {
         tokens.clear();
         containerIpToInstance.clear();
         synthesizedProfiles.clear();
+        forwarders.clear();
         if (httpServer != null) {
             httpServer.close();
             httpServer = null;
@@ -225,7 +281,7 @@ public class Ec2MetadataServer {
         }
         else {
             LOG.debugv("IMDS: token requested from {0}, which is not a registered EC2 container; "
-                    + "metadata requests with this token will fail", ctx.request().remoteAddress().host());
+                    + "metadata requests with this token will fail", callerAddress(ctx));
         }
 
         ctx.response()
@@ -273,6 +329,31 @@ public class Ec2MetadataServer {
         ctx.response().setStatusCode(200)
                 .putHeader("content-type", "text/plain")
                 .end(value);
+    }
+
+    private void handleManagedSshKeys(RoutingContext ctx) {
+        handleInstanceConnect(ctx, (keys, inst) -> keys.activeKeysDocument(inst.getRegion(),
+                inst.getInstanceId(), ctx.pathParam("user")).orElse(null));
+    }
+
+    private void handleInstanceConnect(RoutingContext ctx,
+                                       BiFunction<InstanceConnectKeys, Instance, String> body) {
+        Instance inst = resolveInstance(ctx);
+        if (inst == null) {
+            return;
+        }
+        String value = instanceConnect == null ? null : body.apply(instanceConnect, inst);
+        if (value == null) {
+            ctx.response().setStatusCode(404).end("not-available");
+            return;
+        }
+        ctx.response().setStatusCode(200).putHeader("content-type", "text/plain");
+        if (ctx.request().method() == HttpMethod.HEAD) {
+            ctx.response().putHeader("content-length", String.valueOf(value.getBytes(StandardCharsets.UTF_8).length))
+                    .end();
+        } else {
+            ctx.response().end(value);
+        }
     }
 
     private void handleMac(RoutingContext ctx) {
@@ -390,6 +471,11 @@ public class Ec2MetadataServer {
         ctx.response().putHeader("content-type", "application/json").end(credentialsJson(result.get()));
     }
 
+    /** The instance's zone; one without a placement is in the configured default zone. */
+    private String availabilityZone(Instance inst) {
+        return inst.getPlacement() != null ? inst.getPlacement().getAvailabilityZone() : config.defaultAvailabilityZone();
+    }
+
     /** The account that launched the instance; instances persisted before it was recorded belong to the default one. */
     private String ownerAccount(Instance inst) {
         return inst.getOwnerId() != null ? inst.getOwnerId() : config.defaultAccountId();
@@ -497,8 +583,14 @@ public class Ec2MetadataServer {
     // ── Instance resolution ───────────────────────────────────────────────────
 
     private Instance resolveInstanceByIp(RoutingContext ctx) {
-        String remoteIp = ctx.request().remoteAddress().host();
-        return containerIpToInstance.get(remoteIp);
+        return containerIpToInstance.get(callerAddress(ctx));
+    }
+
+    // The caller's address: the request's own, or the one a trusted relay names for its caller.
+    private String callerAddress(RoutingContext ctx) {
+        String remote = ctx.request().remoteAddress().host();
+        String forwarded = forwarders.contains(remote) ? ctx.request().getHeader("X-Forwarded-For") : null;
+        return forwarded != null && !forwarded.isBlank() ? forwarded.trim() : remote;
     }
 
     /**
@@ -520,8 +612,7 @@ public class Ec2MetadataServer {
     }
 
     private Instance resolveInstance(RoutingContext ctx) {
-        String remoteIp = ctx.request().remoteAddress().host();
-        Instance inst = containerIpToInstance.get(remoteIp);
+        Instance inst = containerIpToInstance.get(callerAddress(ctx));
 
         // IMDSv2: a presented token must be valid; an invalid or expired one gets 401 so the
         // caller fetches a new token. A token is not valid on another instance, so a caller whose
@@ -548,7 +639,7 @@ public class Ec2MetadataServer {
         }
 
         if (inst == null) {
-            String message = unregisteredContainerMessage(remoteIp);
+            String message = unregisteredContainerMessage(callerAddress(ctx));
             LOG.warnv("IMDS: {0}", message);
             ctx.response().setStatusCode(404)
                     .putHeader("content-type", "text/plain")

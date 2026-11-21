@@ -1,7 +1,7 @@
 package io.floci.aws.services.docdb;
 
 import io.floci.aws.services.rds.RdsService;
-import io.floci.aws.testing.RdsAndDocDbMockProfile;
+import io.floci.aws.testing.S3IamEnforcementProfile;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.specification.RequestSpecification;
@@ -28,7 +28,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * starting one costs the test about 30 seconds.
  */
 @QuarkusTest
-@TestProfile(RdsAndDocDbMockProfile.class)
+@TestProfile(S3IamEnforcementProfile.class)
 class SharedClusterIdentifierIntegrationTest {
 
     @Inject
@@ -54,6 +54,104 @@ class SharedClusterIdentifierIntegrationTest {
                 .contentType(URLENC)
                 .formParam("Action", action)
                 .formParam("Version", "2014-10-31");
+    }
+
+    @Test
+    void aRestoreCannotTakeAClusterIdentifierRdsAlreadyHolds() {
+        String held = "restore-target-held-by-rds";
+        createRdsCluster(held);
+        createDocDbCluster("restore-source");
+        query("CreateDBClusterSnapshot")
+                .formParam("DBClusterIdentifier", "restore-source")
+                .formParam("DBClusterSnapshotIdentifier", "restore-source-snapshot")
+        .when().post("/").then().statusCode(200);
+
+        query("RestoreDBClusterFromSnapshot")
+                .formParam("DBClusterIdentifier", held)
+                .formParam("SnapshotIdentifier", "restore-source-snapshot")
+                .formParam("Engine", "docdb")
+        .when().post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("DBClusterAlreadyExistsFault"));
+        query("RestoreDBClusterToPointInTime")
+                .formParam("DBClusterIdentifier", held)
+                .formParam("SourceDBClusterIdentifier", "restore-source")
+                .formParam("UseLatestRestorableTime", "true")
+        .when().post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("DBClusterAlreadyExistsFault"));
+
+        query("DeleteDBClusterSnapshot")
+                .formParam("DBClusterSnapshotIdentifier", "restore-source-snapshot")
+        .when().post("/").then().statusCode(200);
+        deleteCluster("restore-source");
+        deleteCluster(held);
+    }
+
+    @Test
+    void aClusterSnapshotIdentifierIsOneSpaceAcrossRdsAndDocumentDb() {
+        createDocDbCluster("snapshot-space-docdb");
+        createRdsCluster("snapshot-space-rds");
+        query("CreateDBClusterSnapshot")
+                .formParam("DBClusterIdentifier", "snapshot-space-docdb")
+                .formParam("DBClusterSnapshotIdentifier", "snapshot-space-docdb-first")
+        .when().post("/").then().statusCode(200);
+        query("CreateDBClusterSnapshot")
+                .formParam("DBClusterIdentifier", "snapshot-space-rds")
+                .formParam("DBClusterSnapshotIdentifier", "snapshot-space-rds-first")
+        .when().post("/").then().statusCode(200);
+
+        // An RDS cluster's snapshot named like a DocumentDB one: refused, not routed to DocumentDB.
+        query("CreateDBClusterSnapshot")
+                .formParam("DBClusterIdentifier", "snapshot-space-rds")
+                .formParam("DBClusterSnapshotIdentifier", "snapshot-space-docdb-first")
+        .when().post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("DBClusterSnapshotAlreadyExistsFault"));
+        // And the reverse.
+        query("CreateDBClusterSnapshot")
+                .formParam("DBClusterIdentifier", "snapshot-space-docdb")
+                .formParam("DBClusterSnapshotIdentifier", "snapshot-space-rds-first")
+        .when().post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("DBClusterSnapshotAlreadyExistsFault"));
+
+        for (String snapshot : new String[]{"snapshot-space-docdb-first", "snapshot-space-rds-first"}) {
+            query("DeleteDBClusterSnapshot")
+                    .formParam("DBClusterSnapshotIdentifier", snapshot)
+            .when().post("/").then().statusCode(200);
+        }
+        deleteCluster("snapshot-space-docdb");
+        deleteCluster("snapshot-space-rds");
+    }
+
+    private static void createRdsCluster(String id) {
+        query("CreateDBCluster")
+                .formParam("DBClusterIdentifier", id)
+                .formParam("Engine", "aurora-postgresql")
+                .formParam("MasterUsername", "admin")
+                .formParam("MasterUserPassword", "secret99password")
+        .when().post("/").then().statusCode(200);
+    }
+
+    private static void createDocDbCluster(String id) {
+        query("CreateDBCluster")
+                .formParam("DBClusterIdentifier", id)
+                .formParam("Engine", "docdb")
+                .formParam("MasterUsername", "docdbadmin")
+                .formParam("MasterUserPassword", "secret99password")
+        .when().post("/").then().statusCode(200);
+    }
+
+    private static void deleteCluster(String id) {
+        query("DeleteDBCluster")
+                .formParam("DBClusterIdentifier", id)
+                .formParam("SkipFinalSnapshot", "true")
+        .when().post("/").then().statusCode(200);
     }
 
     @Test

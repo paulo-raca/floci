@@ -55,7 +55,8 @@ public class EcrJsonHandler {
             "PutRegistryScanningConfiguration", "GetRegistryScanningConfiguration",
             "BatchGetRepositoryScanningConfiguration",
             "CreateRepositoryCreationTemplate", "UpdateRepositoryCreationTemplate",
-            "DescribeRepositoryCreationTemplates", "DeleteRepositoryCreationTemplate");
+            "DescribeRepositoryCreationTemplates", "DeleteRepositoryCreationTemplate",
+            "ListImages", "DescribeImages");
 
     public Response handle(String action, JsonNode request, String region) {
         if (MODEL_CHECKED.contains(action)) {
@@ -241,14 +242,18 @@ public class EcrJsonHandler {
         List<String> names = parseStringList(request.path("repositoryNames"));
         String registryId = request.path("registryId").asText(null);
 
-        List<Repository> repos = service.describeRepositories(names, registryId, region);
+        PaginatedResult<Repository> page = service.describeRepositories(names, registryId, region,
+                parseMaxResults(request.path("maxResults")), request.path("nextToken").asText(null));
 
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode arr = objectMapper.createArrayNode();
-        for (Repository r : repos) {
+        for (Repository r : page.items()) {
             arr.add(buildRepository(r));
         }
         response.set("repositories", arr);
+        if (page.nextToken() != null) {
+            response.put("nextToken", page.nextToken());
+        }
         return Response.ok(response).build();
     }
 
@@ -352,7 +357,7 @@ public class EcrJsonHandler {
         }
         Integer maxResults = request.hasNonNull("maxResults") ? limit.asInt() : null;
         PaginatedResult<ImageIdentifier> page = service.listImages(repo, registryId, region,
-                maxResults, request.path("nextToken").asText(null));
+                maxResults, request.path("nextToken").asText(null), tagStatus(request));
 
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode arr = objectMapper.createArrayNode();
@@ -366,12 +371,17 @@ public class EcrJsonHandler {
         return Response.ok(response).build();
     }
 
+    private static String tagStatus(JsonNode request) {
+        return request.path("filter").path("tagStatus").asText(null);
+    }
+
     private Response handleDescribeImages(JsonNode request, String region) {
         String repo = request.path("repositoryName").asText(null);
         String registryId = request.path("registryId").asText(null);
         List<ImageIdentifier> requested = parseImageIds(request.path("imageIds"));
 
-        EcrService.DescribeImagesResult result = service.describeImages(repo, requested, registryId, region);
+        EcrService.DescribeImagesResult result = service.describeImages(repo, requested, registryId, region,
+                tagStatus(request));
 
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode details = objectMapper.createArrayNode();

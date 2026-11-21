@@ -26,7 +26,9 @@ import io.floci.aws.services.bedrockagentcorecontrol.BedrockAgentCoreResourcePol
 import io.floci.aws.services.bedrockagentcorecontrol.BedrockAgentCoreToolsController;
 import io.floci.aws.services.bedrockruntime.BedrockRuntimeController;
 import io.floci.aws.services.cloudfront.CloudFrontController;
+import io.floci.aws.services.cloudfront.CloudFrontKeyValueStoreController;
 import io.floci.aws.services.cloudfront.CloudFrontServingController;
+import io.floci.aws.services.cloudwatch.metrics.OtlpMetricsController;
 import io.floci.aws.services.codeartifact.CodeArtifactController;
 import io.floci.aws.services.codeartifact.CodeArtifactMavenController;
 import io.floci.aws.services.codeartifact.CodeArtifactPypiController;
@@ -42,8 +44,10 @@ import io.floci.aws.services.dlm.DlmController;
 import io.floci.aws.services.dsql.DsqlController;
 import io.floci.aws.services.efs.EfsController;
 import io.floci.aws.services.eks.EksController;
+import io.floci.aws.services.emrcontainers.EmrContainersController;
 import io.floci.aws.services.emrserverless.EmrServerlessController;
 import io.floci.aws.services.fis.FisController;
+import io.floci.aws.services.glue.iceberg.GlueIcebergController;
 import io.floci.aws.services.guardduty.GuardDutyController;
 import io.floci.aws.services.inspector2.Inspector2Controller;
 import io.floci.aws.services.iot.IotAuthorizerController;
@@ -51,6 +55,7 @@ import io.floci.aws.services.iot.IotController;
 import io.floci.aws.services.iot.IotDataController;
 import io.floci.aws.services.iot.IotDomainConfigurationController;
 import io.floci.aws.services.iot.IotFleetIndexingController;
+import io.floci.aws.services.iot.IotLoggingController;
 import io.floci.aws.services.lakeformation.LakeFormationController;
 import io.floci.aws.services.lambda.LambdaController;
 import io.floci.aws.services.lambda.durable.DurableExecutionController;
@@ -67,6 +72,9 @@ import io.floci.aws.services.mwaa.MwaaController;
 import io.floci.aws.services.oam.OamController;
 import io.floci.aws.services.opensearch.ElasticsearchController;
 import io.floci.aws.services.opensearch.OpenSearchController;
+import io.floci.aws.services.paymentcryptography.PaymentCryptographyCardController;
+import io.floci.aws.services.paymentcryptography.PaymentCryptographyCryptoController;
+import io.floci.aws.services.paymentcryptography.PaymentCryptographyPinController;
 import io.floci.aws.services.pipes.PipesController;
 import io.floci.aws.services.quicksight.QuickSightController;
 import io.floci.aws.services.quicksight.QuickSightEmbedController;
@@ -99,10 +107,12 @@ import io.floci.aws.services.ses.SesSuppressionController;
 import io.floci.aws.services.ses.SesTagController;
 import io.floci.aws.services.ses.SesTemplateController;
 import io.floci.aws.services.ses.SesTenantController;
+import io.floci.aws.services.signer.SignerController;
 import io.floci.aws.services.signin.SigninController;
 import io.floci.aws.services.ssooidc.SsoOidcController;
 import io.floci.aws.services.ssoportal.SsoPortalController;
 import io.floci.aws.services.swf.model.SwfConstants;
+import io.floci.aws.services.xray.XrayController;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -122,7 +132,11 @@ public class ResolvedServiceCatalog {
      * directory-bucket requests as {@code s3express} while the actions, ARNs and condition keys
      * remain {@code s3}; the IoT Jobs Data Plane signs as {@code iot-jobs-data} while its actions
      * are {@code iot:} ({@code iot:DescribeJobExecution} and peers in the Service Authorization
-     * Reference). Keep this minimal: every entry suppresses a distinct IAM namespace.
+     * Reference); the Payment Cryptography data plane's model signs as
+     * {@code payment-cryptography}, the service the control plane signs for as well, while a
+     * client that signs under the data plane's own name {@code payment-cryptography-data} is
+     * served as that same namespace, whose actions are {@code payment-cryptography:}. Keep
+     * this minimal: every entry suppresses a distinct IAM namespace.
      */
     private static final Map<String, String> CREDENTIAL_SCOPE_ALIASES =
             Map.of(
@@ -130,7 +144,8 @@ public class ResolvedServiceCatalog {
                     "iot-jobs-data", "iot",
                     "monitoring", "cloudwatch",
                     "awsssoportal", "sso",
-                    "eventsv2", "events");
+                    "eventsv2", "events",
+                    "payment-cryptography-data", "payment-cryptography");
 
     private final ServiceCatalog catalog;
 
@@ -275,6 +290,12 @@ public class ResolvedServiceCatalog {
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("emr-serverless"), Set.of(),
                         Set.of(EmrServerlessController.class)),
+                descriptor("emr-containers", "emrcontainers", config.services().emrcontainers().enabled(), true,
+                        "emrcontainers", storageMode(config.storage().services().emrcontainers().mode(), config.storage().mode()),
+                        config.storage().services().emrcontainers().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        Set.of(), Set.of("emr-containers"), Set.of(),
+                        Set.of(EmrContainersController.class)),
                 descriptor("wafv2", "wafv2", config.services().wafv2().enabled(), true,
                         "wafv2", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
@@ -293,7 +314,7 @@ public class ResolvedServiceCatalog {
                         config.storage().services().cloudwatchmetrics().flushIntervalMs(), AwsNamespaces.CW, ServiceProtocol.QUERY,
                         protocols(ServiceProtocol.QUERY, ServiceProtocol.JSON, ServiceProtocol.CBOR),
                         Set.of("GraniteServiceVersion20100801."), Set.of("monitoring"),
-                        Set.of("GraniteServiceVersion20100801"), Set.of(), "CloudWatchVersion20130116."),
+                        Set.of("GraniteServiceVersion20100801"), Set.of(OtlpMetricsController.class), "CloudWatchVersion20130116."),
                 descriptor("paymentcryptography", "paymentcryptography",
                         config.services().paymentcryptography().enabled(), true,
                         "paymentcryptography",
@@ -304,6 +325,21 @@ public class ResolvedServiceCatalog {
                         protocols(ServiceProtocol.JSON),
                         Set.of("PaymentCryptographyControlPlane."), Set.of("payment-cryptography"),
                         Set.of(), Set.of()),
+                descriptor("payment-cryptography-data", "paymentcryptography",
+                        config.services().paymentcryptography().enabled(), true,
+                        "paymentcryptography",
+                        storageMode(config.storage().services().paymentcryptography().mode(),
+                                config.storage().mode()),
+                        config.storage().services().paymentcryptography().flushIntervalMs(), null,
+                        ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        // The data plane is a rest-json service of its own, and its client
+                        // signs for the service, which is one scope for both of its planes; the
+                        // scope its own plane is named by is an alias of that one.
+                        Set.of(), Set.of("payment-cryptography", "payment-cryptography-data"), Set.of(),
+                        Set.of(PaymentCryptographyCryptoController.class,
+                                PaymentCryptographyPinController.class,
+                                PaymentCryptographyCardController.class)),
                 descriptor("secretsmanager", "secretsmanager", config.services().secretsmanager().enabled(), true,
                         "secretsmanager", storageMode(config.storage().services().secretsmanager().mode(), config.storage().mode()),
                         config.storage().services().secretsmanager().flushIntervalMs(), null, ServiceProtocol.JSON,
@@ -358,7 +394,7 @@ public class ResolvedServiceCatalog {
                 descriptor("glue", "glue", config.services().glue().enabled(), true,
                         "glue", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
-                        Set.of("AWSGlue."), Set.of("glue"), Set.of(), Set.of()),
+                        Set.of("AWSGlue."), Set.of("glue"), Set.of(), Set.of(GlueIcebergController.class)),
                 descriptor("firehose", "firehose", config.services().firehose().enabled(), true,
                         "firehose", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
@@ -620,12 +656,16 @@ public class ResolvedServiceCatalog {
                         null, null, 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
                         Set.of("AmazonSSMMessageDeliveryService."), Set.of("ec2messages"), Set.of(), Set.of()),
+                descriptor("ec2-instance-connect", "ec2-instance-connect", config.services().ec2instanceconnect().enabled(), false,
+                        null, null, 5000L, null, ServiceProtocol.JSON,
+                        protocols(ServiceProtocol.JSON),
+                        Set.of("AWSEC2InstanceConnectService."), Set.of("ec2-instance-connect"), Set.of(), Set.of()),
                 descriptor("transfer", "transfer", config.services().transfer().enabled(), true,
                         "transfer", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
                         Set.of("TransferService."), Set.of("transfer"), Set.of(), Set.of()),
                 descriptor("route53", "route53", config.services().route53().enabled(), true,
-                        "route53", config.storage().mode(), 5000L, null, ServiceProtocol.REST_XML,
+                        "route53", config.storage().mode(), 5000L, AwsNamespaces.ROUTE53, ServiceProtocol.REST_XML,
                         protocols(ServiceProtocol.REST_XML),
                         Set.of(), Set.of("route53"), Set.of(), Set.of(Route53Controller.class)),
                 descriptor("textract", "textract", config.services().textract().enabled(), true,
@@ -637,7 +677,8 @@ public class ResolvedServiceCatalog {
                         protocols(ServiceProtocol.JSON),
                         Set.of("Comprehend_20171127."), Set.of("comprehend"), Set.of(), Set.of()),
                 descriptor("rekognition", "rekognition", config.services().rekognition().enabled(), true,
-                        null, null, 5000L, null, ServiceProtocol.JSON,
+                        "rekognition", storageMode(config.storage().services().rekognition().mode(), config.storage().mode()),
+                        config.storage().services().rekognition().flushIntervalMs(), null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
                         Set.of("RekognitionService."), Set.of("rekognition"), Set.of(), Set.of()),
                 descriptor("pricing", "pricing", config.services().pricing().enabled(), true,
@@ -685,6 +726,12 @@ public class ResolvedServiceCatalog {
                         protocols(ServiceProtocol.REST_XML),
                         Set.of(), Set.of("cloudfront"), Set.of(),
                         Set.of(CloudFrontController.class, CloudFrontServingController.class)),
+                descriptor("cloudfront-keyvaluestore", "cloudfront-keyvaluestore",
+                        config.services().cloudfront().enabled(), true,
+                        null, null, 5000L, null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        Set.of(), Set.of("cloudfront-keyvaluestore"), Set.of(),
+                        Set.of(CloudFrontKeyValueStoreController.class)),
                 descriptor("appsync", "appsync", config.services().appsync().enabled(), true,
                         "appsync", storageMode(config.storage().services().appsync().mode(), config.storage().mode()),
                         config.storage().services().appsync().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
@@ -709,7 +756,8 @@ public class ResolvedServiceCatalog {
                         // signs under its own name while IotController serves its /things/*/jobs routes
                         Set.of(), Set.of("iot", "execute-api", "iot-jobs-data"), Set.of(),
                         Set.of(IotController.class, IotDomainConfigurationController.class,
-                                IotAuthorizerController.class, IotFleetIndexingController.class)),
+                                IotAuthorizerController.class, IotFleetIndexingController.class,
+                                IotLoggingController.class)),
                 descriptor("iotdata", "iotdata", config.services().iotdata().enabled(), true,
                         "iot", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
@@ -748,10 +796,18 @@ public class ResolvedServiceCatalog {
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("app-integrations"), Set.of(),
                         Set.of(AppIntegrationsController.class)),
+                descriptor("xray", "xray", config.services().xray().enabled(), true,
+                        "xray", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        Set.of(), Set.of("xray"), Set.of(), Set.of(XrayController.class)),
                 descriptor("dlm", "dlm", config.services().dlm().enabled(), true,
                         "dlm", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("dlm"), Set.of(), Set.of(DlmController.class)),
+                descriptor("signer", "signer", config.services().signer().enabled(), true,
+                        "signer", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        Set.of(), Set.of("signer"), Set.of(), Set.of(SignerController.class)),
                 descriptor("cognito-identity", "cognitoidentity",
                         config.services().cognitoidentity().enabled(), true,
                         "cognitoidentity", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,

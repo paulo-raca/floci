@@ -47,6 +47,9 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.function.UnaryOperator;
 
+import static io.floci.aws.core.common.auth.SigV4RequestValidator.LEGACY_ACCESS_KEY_ID;
+import static io.floci.aws.core.common.auth.SigV4RequestValidator.LEGACY_SECRET_KEY;
+
 /**
  * Verifies header and query SigV4 signatures on every request outside S3
  * when {@code floci.auth.validate-signatures} is enabled, so a request signed with the wrong
@@ -116,10 +119,6 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
     /** REST-XML resources the catalog does not list: S3 Control answers in S3's XML. */
     private static final Set<Class<?>> UNCATALOGUED_REST_XML = Set.of(S3ControlController.class);
 
-    /** The well-known local-dev pair, honoured as every other SigV4 check in Floci honours it. */
-    private static final String LEGACY_ACCESS_KEY_ID = "test";
-    private static final String LEGACY_SECRET_KEY = "test";
-
     private static final String MISMATCH_MESSAGE = "The request signature we calculated does not match "
             + "the signature you provided. Check your AWS Secret Access Key and signing method. "
             + "Consult the service documentation for details.";
@@ -127,8 +126,7 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
 
     // Lazily resolved: JAX-RS providers are instantiated before runtime config mappings exist
     // (the AwsProtocolClaimFilter pattern).
-    private final jakarta.inject.Provider<EmulatorConfig> configProvider;
-    private volatile EmulatorConfig config;
+    private final MemoizedSupplier<EmulatorConfig> config;
     private final IamService iamService;
     private final ResolvedServiceCatalog catalog;
     private final CurrentVertxRequest currentVertxRequest;
@@ -140,19 +138,14 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
     public SigV4HeaderSignatureFilter(jakarta.inject.Provider<EmulatorConfig> configProvider,
                                       IamService iamService, ResolvedServiceCatalog catalog,
                                       CurrentVertxRequest currentVertxRequest) {
-        this.configProvider = configProvider;
+        this.config = new MemoizedSupplier<>(configProvider::get);
         this.iamService = iamService;
         this.catalog = catalog;
         this.currentVertxRequest = currentVertxRequest;
     }
 
     private EmulatorConfig config() {
-        EmulatorConfig resolved = config;
-        if (resolved == null) {
-            resolved = configProvider.get();
-            config = resolved;
-        }
-        return resolved;
+        return config.get();
     }
 
     @Override
@@ -220,18 +213,13 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
         String token = ctx.getHeaderString("X-Amz-Security-Token");
         ServiceDescriptor queryService = null;
         if (presigned) {
-            try {
+            if (token == null) {
+                token = RequestBodyReader.formField(ctx, "X-Amz-Security-Token");
                 if (token == null) {
-                    token = RequestBodyReader.formField(ctx, "X-Amz-Security-Token");
-                    if (token == null) {
-                        token = query.getFirst("X-Amz-Security-Token");
-                    }
+                    token = query.getFirst("X-Amz-Security-Token");
                 }
-                queryService = queryService(ctx, resource);
-            } catch (IllegalArgumentException error) {
-                incompleteSignature(ctx, resource, "Cannot read presigned request form parameters.");
-                return;
             }
+            queryService = queryService(ctx, resource);
         }
         Optional<String> secretKey = resolveSecretKey(scope.accessKeyId(), token);
         if (secretKey.isEmpty()) {

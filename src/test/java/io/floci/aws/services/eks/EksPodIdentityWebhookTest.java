@@ -2,8 +2,6 @@ package io.floci.aws.services.eks;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.floci.aws.core.common.AwsException;
-import io.floci.aws.services.eks.model.Addon;
 import io.floci.aws.services.eks.model.Cluster;
 import io.floci.aws.services.eks.model.PodIdentityAssociationSummary;
 import org.junit.jupiter.api.BeforeEach;
@@ -32,6 +30,7 @@ class EksPodIdentityWebhookTest {
     private static final String CLUSTER_NAME = "demo";
     private static final String ACCOUNT_ID = "123456789012";
     private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final String FLOCI_ENDPOINT = "http://floci.local:4566";
 
     private EksService eks;
     private EksAddonService addons;
@@ -43,13 +42,12 @@ class EksPodIdentityWebhookTest {
         eks = Mockito.mock(EksService.class);
         addons = Mockito.mock(EksAddonService.class);
         associations = Mockito.mock(EksPodIdentityAssociationService.class);
-        webhook = new EksPodIdentityWebhook(eks, addons, associations);
+        webhook = new EksPodIdentityWebhook(eks, addons, associations, () -> FLOCI_ENDPOINT);
 
         Cluster cluster = new Cluster();
         cluster.setName(CLUSTER_NAME);
-        when(eks.findAuthenticationCluster(ACCOUNT_ID, CLUSTER_NAME)).thenReturn(Optional.of(cluster));
-        when(addons.describe(any(), eq(EksPodIdentityWebhook.POD_IDENTITY_ADDON)))
-                .thenReturn(inlineMock(Addon.class));
+        when(eks.findPreRegionalCluster(ACCOUNT_ID, CLUSTER_NAME)).thenReturn(Optional.of(cluster));
+        when(addons.isInstalled(any(), eq(EksPodIdentityWebhook.POD_IDENTITY_ADDON))).thenReturn(true);
         when(associations.list(any(), anyString(), anyString(), any(), any()))
                 .thenReturn(new EksPodIdentityAssociationService.Page(
                         List.of(inlineMock(PodIdentityAssociationSummary.class)), null));
@@ -121,7 +119,9 @@ class EksPodIdentityWebhookTest {
                     {"name":"AWS_CONTAINER_CREDENTIALS_FULL_URI",
                      "value":"http://169.254.170.23/v1/credentials"},
                     {"name":"AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
-                     "value":"/var/run/secrets/pods.eks.amazonaws.com/serviceaccount/eks-pod-identity-token"}]},
+                     "value":"/var/run/secrets/pods.eks.amazonaws.com/serviceaccount/eks-pod-identity-token"},
+                    {"name":"AWS_ENDPOINT_URL","value":"http://floci.local:4566"},
+                    {"name":"AWS_ENDPOINT_URL_STS","value":"http://floci.local:4566"}]},
                   {"op":"add","path":"/spec/containers/0/volumeMounts","value":[
                     {"name":"eks-pod-identity-token",
                      "mountPath":"/var/run/secrets/pods.eks.amazonaws.com/serviceaccount",
@@ -130,7 +130,9 @@ class EksPodIdentityWebhookTest {
                     {"name":"AWS_CONTAINER_CREDENTIALS_FULL_URI",
                      "value":"http://169.254.170.23/v1/credentials"},
                     {"name":"AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
-                     "value":"/var/run/secrets/pods.eks.amazonaws.com/serviceaccount/eks-pod-identity-token"}]}
+                     "value":"/var/run/secrets/pods.eks.amazonaws.com/serviceaccount/eks-pod-identity-token"},
+                    {"name":"AWS_ENDPOINT_URL","value":"http://floci.local:4566"},
+                    {"name":"AWS_ENDPOINT_URL_STS","value":"http://floci.local:4566"}]}
                 ]"""), patch);
     }
 
@@ -149,8 +151,7 @@ class EksPodIdentityWebhookTest {
 
     @Test
     void clusterWithoutThePodIdentityAgentAddonIsNotPatched() throws Exception {
-        when(addons.describe(any(), eq(EksPodIdentityWebhook.POD_IDENTITY_ADDON)))
-                .thenThrow(new AwsException("ResourceNotFoundException", "No addon", 404));
+        when(addons.isInstalled(any(), eq(EksPodIdentityWebhook.POD_IDENTITY_ADDON))).thenReturn(false);
 
         Map<String, Object> review = webhook.review(CLUSTER_NAME, ACCOUNT_ID,
                 admissionReview(pod("checkout", List.of(Map.of("name", "app")))));
@@ -192,9 +193,27 @@ class EksPodIdentityWebhookTest {
         return reviews;
     }
 
+    /**
+     * A route carrying the Region reviews against that Region's cluster. The Region-less route
+     * resolves the cluster created before Regional names, which registered it (#7966).
+     */
+    @Test
+    void aRouteWithARegionReviewsAgainstThatRegionsCluster() throws Exception {
+        Cluster regional = new Cluster();
+        regional.setName(CLUSTER_NAME);
+        when(eks.findAuthenticationCluster(ACCOUNT_ID, "eu-west-1", CLUSTER_NAME)).thenReturn(Optional.of(regional));
+
+        Map<String, Object> review = webhook.review(CLUSTER_NAME, ACCOUNT_ID, "eu-west-1",
+                admissionReview(pod("checkout", List.of(Map.of("name", "app")))));
+
+        assertEquals(3, patchOf(review).size());
+        Mockito.verify(associations).list(eq(regional), eq("payments"), eq("checkout"), any(), any());
+        Mockito.verify(eks, Mockito.never()).findPreRegionalCluster(any(), any());
+    }
+
     @Test
     void internalErrorStillAdmitsThePod() throws Exception {
-        when(eks.findAuthenticationCluster(ACCOUNT_ID, CLUSTER_NAME))
+        when(eks.findPreRegionalCluster(ACCOUNT_ID, CLUSTER_NAME))
                 .thenThrow(new IllegalStateException("storage is gone"));
 
         Map<String, Object> review = webhook.review(CLUSTER_NAME, ACCOUNT_ID,
@@ -218,9 +237,65 @@ class EksPodIdentityWebhookTest {
         JsonNode patch = patchOf(webhook.review(CLUSTER_NAME, ACCOUNT_ID,
                 admissionReview(Map.of("kind", "Pod", "spec", spec))));
 
-        assertEquals(1, patch.size());
+        assertEquals(3, patch.size());
         assertEquals("/spec/containers/0/env/-", patch.get(0).get("path").asText());
         assertEquals("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", patch.get(0).get("value").get("name").asText());
+    }
+
+    /** A workload that points its SDK somewhere itself keeps that choice, for STS too. */
+    @Test
+    void endpointTheContainerSetsItselfIsKept() throws Exception {
+        Map<String, Object> container = Map.of(
+                "name", "app",
+                "env", List.of(Map.of("name", "AWS_ENDPOINT_URL", "value", "http://proxy:8080")));
+
+        JsonNode patch = patchOf(webhook.review(CLUSTER_NAME, ACCOUNT_ID,
+                admissionReview(pod("checkout", List.of(container)))));
+
+        List<String> added = new ArrayList<>();
+        for (JsonNode operation : patch) {
+            if (operation.get("path").asText().equals("/spec/containers/0/env/-")) {
+                added.add(operation.get("value").get("name").asText() + "=" + operation.get("value").get("value").asText());
+            }
+        }
+        assertEquals(List.of(
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI=http://169.254.170.23/v1/credentials",
+                "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE="
+                        + "/var/run/secrets/pods.eks.amazonaws.com/serviceaccount/eks-pod-identity-token"), added);
+    }
+
+    /** What {@code envFrom} brings in is unknown at admission, and an injected env entry would win over it. */
+    @Test
+    void containerWithEnvFromGetsCredentialsButNoEndpoint() throws Exception {
+        Map<String, Object> container = Map.of(
+                "name", "app",
+                "envFrom", List.of(Map.of("configMapRef", Map.of("name", "aws-endpoints"))));
+
+        JsonNode patch = patchOf(webhook.review(CLUSTER_NAME, ACCOUNT_ID,
+                admissionReview(pod("checkout", List.of(container)))));
+
+        JsonNode env = patch.get(patch.size() - 1);
+        assertEquals("/spec/containers/0/env", env.get("path").asText());
+        assertEquals(MAPPER.readTree("""
+                [{"name":"AWS_CONTAINER_CREDENTIALS_FULL_URI","value":"http://169.254.170.23/v1/credentials"},
+                 {"name":"AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+                  "value":"/var/run/secrets/pods.eks.amazonaws.com/serviceaccount/eks-pod-identity-token"}]"""),
+                env.get("value"));
+    }
+
+    /** A pod resolves neither the cluster container's /etc/hosts nor Floci's DNS, so only an IP works. */
+    @Test
+    void endpointIsOnlyInjectedWhereAPodCanResolveIt() throws Exception {
+        assertEquals("http://172.18.0.5:4566",
+                EksPodIdentityWebhook.podReachableEndpoint("http://172.18.0.5:4566"));
+        assertNull(EksPodIdentityWebhook.podReachableEndpoint("http://localhost.floci.io:4566"));
+        assertNull(EksPodIdentityWebhook.podReachableEndpoint("http://host.docker.internal:4566"));
+
+        webhook = new EksPodIdentityWebhook(eks, addons, associations, () -> null);
+        JsonNode patch = patchOf(webhook.review(CLUSTER_NAME, ACCOUNT_ID,
+                admissionReview(pod("checkout", List.of(Map.of("name", "app"))))));
+
+        assertEquals(2, patch.get(patch.size() - 1).get("value").size(), "credentials only");
     }
 
     @Test

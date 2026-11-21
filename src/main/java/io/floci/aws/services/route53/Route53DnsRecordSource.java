@@ -29,7 +29,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Resolves private IPv4/SRV records and public TXT/NS/SOA records for the embedded DNS server.
+ * Resolves private IPv4/SRV records and public A/AAAA/TXT/NS/SOA records for the embedded DNS server.
  *
  * <p>Discovered via CDI as a {@link DnsRecordSource} implementation, keeping
  * the embedded DNS server decoupled from Route 53 service classes.
@@ -47,20 +47,23 @@ public class Route53DnsRecordSource implements DnsRecordSource {
 
     private final Route53Service route53Service;
     private final DnsLookupHelper dnsLookupHelper;
+    private final EmbeddedDnsServer embeddedDnsServer;
     private final Set<String> flociSuffixes = new LinkedHashSet<>();
 
     public Route53DnsRecordSource(Route53Service route53Service) {
-        this(route53Service, null, new DnsLookupHelper());
+        this(route53Service, null, new DnsLookupHelper(), null);
     }
 
     public Route53DnsRecordSource(Route53Service route53Service, EmulatorConfig config) {
-        this(route53Service, config, new DnsLookupHelper(config));
+        this(route53Service, config, new DnsLookupHelper(config), null);
     }
 
     @Inject
-    public Route53DnsRecordSource(Route53Service route53Service, EmulatorConfig config, DnsLookupHelper dnsLookupHelper) {
+    public Route53DnsRecordSource(Route53Service route53Service, EmulatorConfig config, DnsLookupHelper dnsLookupHelper,
+                                  EmbeddedDnsServer embeddedDnsServer) {
         this.route53Service = route53Service;
         this.dnsLookupHelper = dnsLookupHelper != null ? dnsLookupHelper : new DnsLookupHelper(config);
+        this.embeddedDnsServer = embeddedDnsServer;
         this.flociSuffixes.addAll(BUILTIN_SUFFIXES);
         if (config != null) {
             config.hostname().ifPresent(this.flociSuffixes::add);
@@ -72,7 +75,12 @@ public class Route53DnsRecordSource implements DnsRecordSource {
 
     @Override
     public Optional<DnsAnswer> resolveAuthoritative(String name, int type) {
-        if (name == null || name.isBlank() || (type != 2 && type != 6 && type != 16)) {
+        return resolveAuthoritative(name, type, null);
+    }
+
+    @Override
+    public Optional<DnsAnswer> resolveAuthoritative(String name, int type, String listenerAddress) {
+        if (name == null || name.isBlank() || (type != 1 && type != 2 && type != 6 && type != 16 && type != 28)) {
             return Optional.empty();
         }
         if (route53Service.isCoveredByPrivateZone(name)) {
@@ -104,18 +112,21 @@ public class Route53DnsRecordSource implements DnsRecordSource {
             return Optional.of(DnsAnswer.refused());
         }
         String recordType = switch (type) {
+            case 1 -> "A";
+            case 28 -> "AAAA";
             case 2 -> "NS";
             case 6 -> "SOA";
             default -> "TXT";
         };
         Function<String, DnsRecord> recordFactory = switch (type) {
+            case 1, 28 -> value -> new DnsRecord.Address(type, value);
             case 2 -> DnsRecord.Ns::new;
             case 6 -> DnsRecord.Soa::new;
             default -> DnsRecord.Txt::new;
         };
-        DnsAnswer answer = buildRecords(name, zone.matchingRecords().stream()
+        DnsAnswer answer = buildPublicRecords(name, type, zone.matchingRecords().stream()
                 .filter(record -> record.getType().equals(recordType)).toList(),
-                recordFactory, Route53DnsRecordSource::publicTtlOf);
+                recordFactory, listenerAddress);
         if (answer.responseCode() != 0) {
             return Optional.of(answer);
         }
@@ -137,6 +148,32 @@ public class Route53DnsRecordSource implements DnsRecordSource {
             LOG.debugv("Cannot encode public DNS records for {0}: {1}", name, e.getMessage());
             return Optional.of(DnsAnswer.refused());
         }
+    }
+
+    private DnsAnswer buildPublicRecords(String name, int type, List<ResourceRecordSet> sets,
+                                        Function<String, DnsRecord> recordFactory, String listenerAddress) {
+        if (sets.stream().noneMatch(record -> record.getAliasTarget() != null)) {
+            return buildRecords(name, sets, recordFactory, Route53DnsRecordSource::publicTtlOf);
+        }
+        if (sets.size() != 1 || embeddedDnsServer == null || (type != 1 && type != 28)) {
+            return DnsAnswer.refused();
+        }
+        ResourceRecordSet record = sets.getFirst();
+        AliasTarget alias = record.getAliasTarget();
+        if (record.getSetIdentifier() != null || record.getWeight() != null || record.getRegion() != null
+                || record.getFailover() != null || record.getHealthCheckId() != null
+                || Boolean.TRUE.equals(record.getMultiValueAnswer())
+                || record.getTtl() != null
+                || record.getRecords() != null && !record.getRecords().isEmpty()) {
+            return DnsAnswer.refused();
+        }
+        // A single simple alias still answers when unhealthy, since there is no alternative record.
+        DnsAnswer target = embeddedDnsServer.resolveAliasTarget(
+                alias.getDnsName(), alias.getHostedZoneId(), type, listenerAddress).orElseGet(DnsAnswer::refused);
+        if (target.responseCode() != 0 || target.records().stream().anyMatch(value -> value.type() != type)) {
+            return DnsAnswer.refused();
+        }
+        return target;
     }
 
     @Override
@@ -333,7 +370,16 @@ public class Route53DnsRecordSource implements DnsRecordSource {
         return false;
     }
 
+    /**
+     * The address the embedded DNS server answers Floci's own names with, so a record pointing at one resolves as the
+     * name itself does. The host's own lookup takes the first of this container's networks by name, which after a crash
+     * can be one Floci made and is still on; it answers only where that server has no address.
+     */
     private Optional<String> getLocalFlociAddress() {
+        Optional<String> serverIp = embeddedDnsServer != null ? embeddedDnsServer.getServerIp() : Optional.empty();
+        if (serverIp.isPresent()) {
+            return serverIp;
+        }
         try {
             return Optional.of(InetAddress.getLocalHost().getHostAddress());
         } catch (Exception e) {

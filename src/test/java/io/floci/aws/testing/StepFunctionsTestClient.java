@@ -2,6 +2,7 @@ package io.floci.aws.testing;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.services.sqs.SqsService;
 import io.restassured.response.Response;
 
 import java.util.ArrayList;
@@ -39,15 +40,77 @@ public final class StepFunctionsTestClient {
         this.cleanup = cleanup;
     }
 
+    public static String allow(String resource, String... actions) {
+        return policy(List.of(Map.of("Effect", "Allow", "Action", List.of(actions), "Resource", resource)));
+    }
+
+    /** A policy document holding {@code statements}. */
+    public static String policy(List<Map<String, Object>> statements) {
+        try {
+            return MAPPER.writeValueAsString(Map.of("Version", "2012-10-17", "Statement", statements));
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    public String role(String account, String namePrefix, String trust, String policy) {
+        return EnforcementFixtures.createRole(cleanup, port, account, "/", namePrefix + UUID.randomUUID(), trust, policy);
+    }
+
+    /** A bucket {@code account} creates in {@code region}, removed again by {@code cleanup}. */
+    public String bucket(String account, String region, String namePrefix) {
+        String name = namePrefix + UUID.randomUUID();
+        String authorization = auth(account, region, "s3");
+        given().port(port).header("Authorization", authorization)
+                .body("us-east-1".equals(region) ? "" : "<CreateBucketConfiguration><LocationConstraint>" + region
+                        + "</LocationConstraint></CreateBucketConfiguration>")
+                .put("/" + name).then().statusCode(200);
+        cleanup.register(() -> EnforcementFixtures.removeBucket(port, authorization, name));
+        return name;
+    }
+
+    /** Puts {@code policy} on {@code bucket} as {@code account}. */
+    public void setBucketPolicy(String account, String bucket, String policy) {
+        given().port(port).header("Authorization", auth(account, "s3")).body(policy)
+                .queryParam("policy", "").put("/" + bucket).then().statusCode(200);
+    }
+
+    public SqsTestQueue queue(SqsService service, String account, String region, String namePrefix) {
+        SqsTestQueue queue = SqsTestQueue.create(service, account, region, namePrefix);
+        cleanup.register(queue::delete);
+        return queue;
+    }
+
+    public String machine(String account, String namePrefix, Map<String, Object> task, String role) throws Exception {
+        return machineWithDefinition(account, namePrefix, MAPPER.writeValueAsString(
+                Map.of("StartAt", "Send", "States", Map.of("Send", task))), role);
+    }
+
+    public String machineWithDefinition(String account, String namePrefix, String definition, String role) {
+        return createMachine(account, namePrefix, definition, "STANDARD", role);
+    }
+
     public Response request(String account, String action, Map<String, ?> input) {
-        return given().port(port).header("Authorization", auth(account, "states"))
-                .header("X-Amz-Target", "AWSStepFunctions." + action)
-                .contentType("application/x-amz-json-1.0").body(MAPPER.valueToTree(input).toString()).post("/");
+        return json(account, "states", "AWSStepFunctions." + action, "application/x-amz-json-1.0", input);
+    }
+
+    /**
+     * A JSON-protocol request to the service a task calls, signed as {@code account} for {@code signingName}, so a
+     * test reads and sets up the resources a task reaches in the account its execution runs in.
+     */
+    public Response json(String account, String signingName, String target, String contentType, Map<String, ?> body) {
+        return given().port(port).header("Authorization", auth(account, signingName))
+                .header("X-Amz-Target", target)
+                .contentType(contentType).body(MAPPER.valueToTree(body).toString()).post("/");
     }
 
     /** Creates a state machine in us-east-1, which the end of the test stops and deletes. */
     public String createMachine(String account, String namePrefix, String definition, String type, String role) {
-        String name = namePrefix + UUID.randomUUID();
+        return createMachineNamed(account, namePrefix + UUID.randomUUID(), definition, type, role);
+    }
+
+    /** {@link #createMachine} under the exact {@code name}, for a test that needs the machine's ARN up front. */
+    public String createMachineNamed(String account, String name, String definition, String type, String role) {
         String arn = "arn:aws:states:us-east-1:" + account + ":stateMachine:" + name;
         cleanup.register(() -> removeMachine(account, arn));
         Response created = request(account, "CreateStateMachine", Map.of(

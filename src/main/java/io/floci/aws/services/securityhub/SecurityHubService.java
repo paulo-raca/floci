@@ -10,25 +10,36 @@ import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.Pagination;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.Resettable;
+import io.floci.aws.core.common.StoredResourceArns;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.organizations.OrganizationsService;
 import io.floci.aws.services.securityhub.model.SecurityHubAssociation;
+import io.floci.aws.services.securityhub.model.SecurityHubMember;
 import io.floci.aws.services.securityhub.model.SecurityHubState;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 @ApplicationScoped
-public class SecurityHubService implements Resettable {
+public class SecurityHubService implements Resettable, StoredResourceArns {
     private static final String SELF_MANAGED = "SELF_MANAGED_SECURITY_HUB";
+    private static final String MEMBER_CREATED = "Created";
+    private static final String MEMBER_ENABLED = "Enabled";
+    private static final String MEMBER_REMOVED = "Removed";
     private static final List<String> LINKING_MODES = List.of(
             "ALL_REGIONS", "ALL_REGIONS_EXCEPT_SPECIFIED", "SPECIFIED_REGIONS", "NO_REGIONS");
+
+    /** What a configuration policy's ARN resource starts with, its id following. */
+    private static final String POLICY_RESOURCE = "configuration-policy/";
 
     private final AccountAwareStorageBackend<SecurityHubState> states;
     private final RegionResolver regionResolver;
@@ -83,6 +94,242 @@ public class SecurityHubService implements Resettable {
         }
         states.putForAccount(adminAccountId, region, delegated);
         return management;
+    }
+
+    /**
+     * DisableOrganizationAdminAccount: removes the delegation. The former administrator keeps Security Hub
+     * enabled, but loses its organization role, so the organization members it managed become Removed.
+     */
+    public synchronized void disableOrganizationAdminAccount(String region, String adminAccountId, String feature) {
+        requireAccountId(adminAccountId, "AdminAccountId");
+        String requestedFeature = normalizeFeature(feature);
+        String managementAccountId = requireCallerManagementAccount();
+        SecurityHubState management = state(region);
+        if (!adminAccountId.equals(management.getAdminAccountId())
+                || !requestedFeature.equals(management.getAdminFeature())) {
+            throw invalid("Account " + adminAccountId + " is not the " + requestedFeature
+                    + " administrator account for the organization.");
+        }
+        // The management account can delegate to itself, and then both states are the same stored record.
+        boolean selfDelegated = adminAccountId.equals(managementAccountId);
+        SecurityHubState delegated = selfDelegated
+                ? management : states.getForAccount(adminAccountId, region).orElse(null);
+        String now = Instant.now().toString();
+        if (delegated != null) {
+            delegated.setAdminAccountId(null);
+            delegated.setAdminFeature("SecurityHub");
+            for (SecurityHubMember member : delegated.getMembers().values()) {
+                if (member.isOrganizationMember() && !MEMBER_REMOVED.equals(member.getMemberStatus())) {
+                    member.setMemberStatus(MEMBER_REMOVED);
+                    member.setUpdatedAt(now);
+                }
+            }
+        }
+        management.setAdminAccountId(null);
+        management.setAdminFeature("SecurityHub");
+        save(region, management);
+        if (delegated != null && !selfDelegated) {
+            states.putForAccount(adminAccountId, region, delegated);
+        }
+    }
+
+    // ── Members ───────────────────────────────────────────────────────────────
+
+    /** A CreateMembers or DeleteMembers entry Security Hub did not act on, with the reason. */
+    public record UnprocessedAccount(String accountId, String processingResult) {}
+
+    private record AccountDetail(String accountId, String email) {}
+
+    /**
+     * CreateMembers: an account in the caller's organization, added by the delegated administrator, becomes
+     * an Enabled member at once and has Security Hub and its default standards enabled for it. Any other
+     * account is Created and would need an invitation. Accounts Security Hub cannot add are reported back
+     * rather than failing the batch; a malformed entry fails it before anything is changed.
+     */
+    public synchronized List<UnprocessedAccount> createMembers(String region, JsonNode request) {
+        SecurityHubState administrator = requireSubscribed(region);
+        JsonNode details = request == null ? null : request.get("AccountDetails");
+        if (details == null || !details.isArray() || details.isEmpty() || details.size() > 50) {
+            throw invalid("AccountDetails must hold 1 to 50 accounts.");
+        }
+        // Every entry is checked before any is applied: applying one enables Security Hub in that account
+        // and changes the live stored state, so a later malformed entry must not leave a half-applied batch.
+        List<AccountDetail> accounts = new ArrayList<>(details.size());
+        for (JsonNode detail : details) {
+            String accountId = requireText(detail, "AccountId", "InvalidInputException");
+            String email = text(detail, "Email");
+            if (email != null && email.isBlank()) {
+                throw invalid("Email must contain a non-whitespace character.");
+            }
+            accounts.add(new AccountDetail(accountId, email));
+        }
+        String administratorId = regionResolver.getAccountId();
+        boolean delegatedAdministrator = administratorId.equals(administrator.getAdminAccountId())
+                && "SecurityHub".equals(administrator.getAdminFeature());
+        String organization = delegatedAdministrator
+                ? organizationsService.findManagementAccountForResource(administratorId).orElse(null) : null;
+        List<UnprocessedAccount> unprocessed = new ArrayList<>();
+        String now = Instant.now().toString();
+        for (AccountDetail account : accounts) {
+            String accountId = account.accountId();
+            String email = account.email();
+            if (!accountId.matches("\\d{12}")) {
+                unprocessed.add(new UnprocessedAccount(accountId, "Invalid account ID."));
+                continue;
+            }
+            if (accountId.equals(administratorId)) {
+                unprocessed.add(new UnprocessedAccount(accountId,
+                        "The administrator account cannot be added as a member account."));
+                continue;
+            }
+            SecurityHubMember existing = administrator.getMembers().get(accountId);
+            boolean organizationMember = organization != null && organization.equals(
+                    organizationsService.findManagementAccountForResource(accountId).orElse(null));
+            // A member stays as it is, unless it was Removed, or was Created before it joined the organization.
+            boolean joinedOrganization = existing != null && organizationMember
+                    && MEMBER_CREATED.equals(existing.getMemberStatus());
+            if (existing != null && !MEMBER_REMOVED.equals(existing.getMemberStatus()) && !joinedOrganization) {
+                continue;
+            }
+            if (organizationMember && !enableForOrganizationMember(region, accountId, organization)) {
+                unprocessed.add(new UnprocessedAccount(accountId, "Security Hub CSPM cannot be enabled "
+                        + "automatically for the organization management account. Enable it in that account first."));
+                continue;
+            }
+            administrator.getMembers().put(accountId, new SecurityHubMember(
+                    accountId,
+                    email != null ? email : existing == null ? null : existing.getEmail(),
+                    administratorId,
+                    organizationMember ? MEMBER_ENABLED : MEMBER_CREATED,
+                    organizationMember,
+                    organizationMember ? now : null,
+                    now));
+        }
+        save(region, administrator);
+        return unprocessed;
+    }
+
+    /** Enables Security Hub with its default standards for an organization account; false if Security Hub may not. */
+    private boolean enableForOrganizationMember(String region, String accountId, String managementAccountId) {
+        SecurityHubState member = states.getForAccount(accountId, region).orElseGet(SecurityHubState::new);
+        if (member.isEnabled()) {
+            return true;
+        }
+        if (accountId.equals(managementAccountId)) {
+            return false;
+        }
+        member.setEnabled(true);
+        for (Standard standard : STANDARDS) {
+            if (standard.enabledByDefault()) {
+                member.getStandardsSubscriptions().put(
+                        subscriptionArn(region, accountId, standard), standardsArn(region, standard));
+            }
+        }
+        states.putForAccount(accountId, region, member);
+        return true;
+    }
+
+    /** ListMembers: only Enabled members unless OnlyAssociated is false, in account ID order. */
+    public synchronized PaginatedResult<SecurityHubMember> memberPage(String region, String onlyAssociatedValue,
+                                                                     String maxResultsValue, String nextToken) {
+        SecurityHubState administrator = requireSubscribed(region);
+        boolean onlyAssociated = true;
+        if (onlyAssociatedValue != null) {
+            if (!"true".equalsIgnoreCase(onlyAssociatedValue) && !"false".equalsIgnoreCase(onlyAssociatedValue)) {
+                throw invalid("OnlyAssociated must be true or false.");
+            }
+            onlyAssociated = Boolean.parseBoolean(onlyAssociatedValue);
+        }
+        Integer maxResults = Pagination.parseMaxResults(maxResultsValue, "InvalidInputException");
+        if (maxResults != null && (maxResults < 1 || maxResults > 50)) {
+            throw invalid("MaxResults must be between 1 and 50.");
+        }
+        boolean associatedOnly = onlyAssociated;
+        List<SecurityHubMember> members = administrator.getMembers().values().stream()
+                .filter(member -> !associatedOnly || MEMBER_ENABLED.equals(member.getMemberStatus()))
+                .sorted(Comparator.comparing(SecurityHubMember::getAccountId))
+                .map(SecurityHubMember::copy)
+                .toList();
+        return Pagination.paginate(members, SecurityHubMember::getAccountId, maxResults, nextToken,
+                50, 50, "InvalidInputException", "NextToken");
+    }
+
+    /** GetMembers: the named members whatever their status; an account that is not one is reported back. */
+    public synchronized MemberLookup getMembers(String region, JsonNode request) {
+        SecurityHubState administrator = requireSubscribed(region);
+        List<SecurityHubMember> found = new ArrayList<>();
+        List<UnprocessedAccount> unprocessed = new ArrayList<>();
+        for (String accountId : accountIds(request)) {
+            SecurityHubMember member = administrator.getMembers().get(accountId);
+            if (member == null) {
+                unprocessed.add(new UnprocessedAccount(accountId, "Account is not a member of this administrator."));
+            } else {
+                found.add(member.copy());
+            }
+        }
+        return new MemberLookup(found, unprocessed);
+    }
+
+    public record MemberLookup(List<SecurityHubMember> members, List<UnprocessedAccount> unprocessed) {}
+
+    /**
+     * DisassociateMembers: the named members become Removed. Every account is checked before any changes,
+     * so an account that is not a member fails the whole request with ResourceNotFoundException.
+     */
+    public synchronized void disassociateMembers(String region, JsonNode request) {
+        SecurityHubState administrator = requireSubscribed(region);
+        List<String> accountIds = accountIds(request);
+        for (String accountId : accountIds) {
+            if (!administrator.getMembers().containsKey(accountId)) {
+                throw notFound("Account " + accountId + " is not a member of this administrator.");
+            }
+        }
+        String now = Instant.now().toString();
+        for (String accountId : accountIds) {
+            SecurityHubMember member = administrator.getMembers().get(accountId);
+            if (!MEMBER_REMOVED.equals(member.getMemberStatus())) {
+                member.setMemberStatus(MEMBER_REMOVED);
+                member.setUpdatedAt(now);
+            }
+        }
+        save(region, administrator);
+    }
+
+    /**
+     * DeleteMembers: removes invited members. An organization account cannot be deleted, only disassociated,
+     * so it is reported back, as is an account that is not a member.
+     */
+    public synchronized List<UnprocessedAccount> deleteMembers(String region, JsonNode request) {
+        SecurityHubState administrator = requireSubscribed(region);
+        List<UnprocessedAccount> unprocessed = new ArrayList<>();
+        for (String accountId : accountIds(request)) {
+            SecurityHubMember member = administrator.getMembers().get(accountId);
+            if (member == null) {
+                unprocessed.add(new UnprocessedAccount(accountId, "Account is not a member of this administrator."));
+            } else if (member.isOrganizationMember()) {
+                unprocessed.add(new UnprocessedAccount(accountId,
+                        "An account that belongs to the organization cannot be deleted; disassociate it instead."));
+            } else {
+                administrator.getMembers().remove(accountId);
+            }
+        }
+        save(region, administrator);
+        return unprocessed;
+    }
+
+    private static List<String> accountIds(JsonNode request) {
+        JsonNode ids = request == null ? null : request.get("AccountIds");
+        if (ids == null || !ids.isArray()) {
+            throw invalid("AccountIds is required.");
+        }
+        List<String> accountIds = new ArrayList<>(ids.size());
+        for (JsonNode id : ids) {
+            if (!id.isTextual()) {
+                throw invalid("AccountIds must contain account ID strings.");
+            }
+            accountIds.add(id.textValue());
+        }
+        return accountIds;
     }
 
     public synchronized void enableSecurityHub(String region, JsonNode request) {
@@ -147,7 +394,11 @@ public class SecurityHubService implements Resettable {
     }
 
     public String subscriptionArn(String region, Standard standard) {
-        return regionResolver.buildArn("securityhub", region,
+        return subscriptionArn(region, regionResolver.getAccountId(), standard);
+    }
+
+    private String subscriptionArn(String region, String accountId, Standard standard) {
+        return regionResolver.buildArn("securityhub", region, accountId,
                 "subscription/" + standard.path().substring(standard.path().indexOf('/') + 1));
     }
 
@@ -549,8 +800,12 @@ public class SecurityHubService implements Resettable {
             }
             return Map.copyOf(state.getHubTags());
         }
-        JsonNode resource = taggedPolicy(state, region, arn);
-        JsonNode tags = resource.get("Tags");
+        return policyTags(taggedPolicy(state, region, arn));
+    }
+
+    /** The tags a configuration policy holds, its {@code Tags} object's string members, by key. */
+    private static Map<String, String> policyTags(JsonNode policy) {
+        JsonNode tags = policy.get("Tags");
         if (tags == null || !tags.isObject()) {
             return Map.of();
         }
@@ -561,6 +816,53 @@ public class SecurityHubService implements Resettable {
             }
         });
         return result;
+    }
+
+    @Override
+    public String namespace() {
+        return "securityhub";
+    }
+
+    /**
+     * A request names its hub by the Region it is signed for, and a configuration policy by the id Security Hub minted,
+     * which its ARN ends in: nothing to find.
+     */
+    @Override
+    public Optional<String> find(String type, List<String> names, String region) {
+        return Optional.empty();
+    }
+
+    /**
+     * The tags of the hub or the configuration policy whose ARN is {@code arn}, in the request's account, where the tag
+     * handlers read: an ARN of another account names none. Read in place from the account's state for the Region the
+     * ARN names, a state stored before storage was account-aware included, and matched on the whole ARN, the one
+     * {@link #hubArn} or {@link #policyArn} gives; a hub reads its tags only while Security Hub is enabled there, as
+     * the tag handlers do. A policy's tags change in place under this service's lock, so the read takes that lock.
+     */
+    @Override
+    public synchronized Map<String, String> storedTags(String arn) {
+        if (!AwsArnUtils.isArnFor(arn, "securityhub")) {
+            return Map.of();
+        }
+        AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+        String account = regionResolver.getAccountId();
+        if (!account.equals(parsed.accountId()) || parsed.region().isEmpty()) {
+            return Map.of();
+        }
+        String region = parsed.region();
+        Optional<SecurityHubState> state = AccountAwareStorageBackend.readInAccount(states, account, region);
+        if (state.isEmpty()) {
+            return Map.of();
+        }
+        if (arn.equals(hubArn(region))) {
+            return state.get().isEnabled() ? new LinkedHashMap<>(state.get().getHubTags()) : Map.of();
+        }
+        if (!parsed.resource().startsWith(POLICY_RESOURCE)) {
+            return Map.of();
+        }
+        String id = parsed.resource().substring(POLICY_RESOURCE.length());
+        JsonNode policy = state.get().getPolicies().get(id);
+        return policy == null || !arn.equals(policyArn(region, id)) ? Map.of() : policyTags(policy);
     }
 
     public synchronized void tagResource(String region, String arn, Map<String, String> tags) {
@@ -640,7 +942,7 @@ public class SecurityHubService implements Resettable {
     }
 
     public String policyArn(String region, String id) {
-        return regionResolver.buildArn("securityhub", region, "configuration-policy/" + id);
+        return regionResolver.buildArn("securityhub", region, POLICY_RESOURCE + id);
     }
 
     private static SecurityHubState copyConfigurationState(SecurityHubState source) {

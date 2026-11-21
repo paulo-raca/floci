@@ -29,6 +29,7 @@ import java.security.KeyPairGenerator;
 import java.security.spec.ECGenParameterSpec;
 import java.time.Instant;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -125,6 +126,8 @@ class CloudFrontServiceTest {
                     + "<Items><Location>US</Location><Location>CA</Location></Items>"
                     + "</GeoRestriction></Restrictions>";
 
+    private final Map<String, AccountAwareStorageBackend<?>> stores = new HashMap<>();
+
     private CloudFrontService serviceWithDomainSuffix(String domainSuffix) {
         return serviceWithDomainSuffix(domainSuffix, "us-east-1");
     }
@@ -135,9 +138,11 @@ class CloudFrontServiceTest {
     }
 
     private CloudFrontService serviceWithDomainSuffix(String domainSuffix, String region, String baseUrl) {
+        stores.clear();
         StorageFactory storageFactory = Mockito.mock(StorageFactory.class);
         when(storageFactory.create(Mockito.anyString(), Mockito.anyString(), Mockito.any()))
-                .thenAnswer(invocation -> AccountAwareStorageBackend.inMemory("000000000000"));
+                .thenAnswer(invocation -> stores.computeIfAbsent(invocation.getArgument(1, String.class),
+                        ignored -> AccountAwareStorageBackend.inMemory("000000000000")));
 
         EmulatorConfig config = Mockito.mock(EmulatorConfig.class);
         EmulatorConfig.DnsConfig dnsConfig = Mockito.mock(EmulatorConfig.DnsConfig.class);
@@ -343,6 +348,61 @@ class CloudFrontServiceTest {
         assertEquals(Map.of("team", "infra"), service.listTagsForResource(dist.getArn()));
     }
 
+    /**
+     * IAM's tag lookup, which the key value store service answers for the namespace, reads the tags CloudFront holds
+     * under the whole ARN where its tag handlers keep them, in the account the request runs in, from the store this
+     * service writes them to; the ARN's account does not move the read, since CloudFront ARNs name the default one.
+     */
+    @Test
+    void storedTagsAreTheTagsHeldUnderTheWholeArnWhereTheRequestRuns() {
+        CloudFrontService service = serviceWithDomainSuffix(DEFAULT_DOMAIN_SUFFIX);
+        CloudFrontKeyValueStoreService lookup = keyValueStoresOnTheSameFiles();
+        Distribution dist = service.createDistribution(new Distribution(), Map.of("team", "data"));
+        service.tagResource(dist.getArn(), Map.of("env", "prod"));
+        String otherAccountArn = dist.getArn().replace(ACCOUNT, "111111111111");
+        service.tagResource(otherAccountArn, Map.of("owner", "them"));
+
+        assertEquals(Map.of("team", "data", "env", "prod"), lookup.storedTags(dist.getArn()));
+        assertEquals(Map.of("owner", "them"), lookup.storedTags(otherAccountArn));
+        assertEquals(Map.of(), lookup.storedTags(dist.getArn() + "X"));
+        assertEquals(Map.of(), lookup.storedTags("arn:aws:s3:::" + dist.getId().toLowerCase()));
+    }
+
+    /** A function's ARN is its name, so one deleted and created again starts with no tags, for IAM as for the API. */
+    @Test
+    void aFunctionCreatedAgainUnderADeletedOnesNameHasNoneOfItsTags() {
+        CloudFrontService service = serviceWithDomainSuffix(DEFAULT_DOMAIN_SUFFIX);
+        CloudFrontKeyValueStoreService lookup = keyValueStoresOnTheSameFiles();
+        String arn = service.functionArn("tagged");
+        service.tagResource(arn, Map.of("seeded", "before"));
+        CloudFrontFunction created = service.createFunction(function("tagged"));
+        assertEquals(Map.of(), service.listTagsForResource(arn));
+        service.tagResource(arn, Map.of("team", "data"));
+
+        service.deleteFunction("tagged", created.getEtag());
+        service.createFunction(function("tagged"));
+
+        assertEquals(Map.of(), service.listTagsForResource(arn));
+        assertEquals(Map.of(), lookup.storedTags(arn));
+    }
+
+    /** A key value store service on the same per-file stores as the service {@link #serviceWithDomainSuffix} built. */
+    private CloudFrontKeyValueStoreService keyValueStoresOnTheSameFiles() {
+        StorageFactory sameFiles = Mockito.mock(StorageFactory.class);
+        when(sameFiles.create(Mockito.anyString(), Mockito.anyString(), Mockito.any()))
+                .thenAnswer(invocation -> stores.computeIfAbsent(invocation.getArgument(1, String.class),
+                        ignored -> AccountAwareStorageBackend.inMemory(ACCOUNT)));
+        return new CloudFrontKeyValueStoreService(sameFiles, new RegionResolver("us-east-1", ACCOUNT));
+    }
+
+    private static CloudFrontFunction function(String name) {
+        CloudFrontFunction function = new CloudFrontFunction();
+        function.setName(name);
+        function.setFunctionCode("function handler(event) { return event.request; }");
+        function.setRuntime("cloudfront-js-2.0");
+        return function;
+    }
+
     @Test
     void deletingDistributionRemovesTagsStoredUnderItsArn() {
         CloudFrontService service = serviceWithDomainSuffix(DEFAULT_DOMAIN_SUFFIX);
@@ -473,6 +533,24 @@ class CloudFrontServiceTest {
         assertNull(service.findByHost("a." + id + ".cloudfront.localhost.floci.io"));
         assertNull(service.findByHost("EABCDEFGHIJKLM.cloudfront.localhost.floci.io"));
         assertNull(service.findByHost(".cloudfront.localhost"));
+
+        // The id and the suffix are compared apart, ignoring case.
+        assertEquals(id, service.findByHost(id + ".CLOUDFRONT.LOCALHOST").getId());
+        assertNull(service.findByHost(id + ".cloudfront.localhosx"));
+        assertNull(service.findByHost("X" + id.substring(1) + ".cloudfront.localhost"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void findByHostIgnoresADistributionOfAnotherAccount() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        Distribution dist = service.createDistribution(distribution(true, List.of()), Map.of());
+        AccountAwareStorageBackend<Distribution> distributions =
+                (AccountAwareStorageBackend<Distribution>) stores.get("cloudfront-distributions.json");
+        distributions.deleteForAccount("000000000000", dist.getId());
+        distributions.putForAccount("111122223333", dist.getId(), dist);
+
+        assertNull(service.findByHost(dist.getDomainName()));
     }
 
     @Test
@@ -1763,6 +1841,38 @@ class CloudFrontServiceTest {
                         ResponseHeadersPolicyConfigCodec.PolicyHeader::value,
                         (left, right) -> right,
                         LinkedHashMap::new));
+    }
+
+    @Test
+    void createDistributionKeepsTheConnectionModeTheConfigNames() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        Distribution tenantOnly = distribution(true, List.of());
+        tenantOnly.getConfig().setConnectionMode("tenant-only");
+
+        Distribution created = service.createDistribution(tenantOnly, Map.of());
+
+        assertEquals("tenant-only", service.getDistribution(created.getId()).getConfig().getConnectionMode());
+    }
+
+    @Test
+    void createAndUpdateDistributionRefuseAConnectionModeOutsideItsEnumeration() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        Distribution created = service.createDistribution(distribution(true, List.of()), Map.of());
+        Distribution shared = distribution(true, List.of());
+        shared.getConfig().setConnectionMode("shared");
+
+        AwsException onCreate = assertAws("InvalidArgument",
+                () -> service.createDistribution(shared, Map.of()));
+        AwsException onUpdate = assertAws("InvalidArgument",
+                () -> service.updateDistribution(created.getId(), created.getEtag(), shared));
+
+        assertEquals("The ConnectionMode specified is not valid.", onCreate.getMessage());
+        assertEquals("The ConnectionMode specified is not valid.", onUpdate.getMessage());
+        // Neither refusal stored anything: no second distribution, and the first is as it was.
+        assertEquals(1, service.listDistributions(null, 100).size());
+        Distribution unchanged = service.getDistribution(created.getId());
+        assertNull(unchanged.getConfig().getConnectionMode());
+        assertEquals(created.getEtag(), unchanged.getEtag());
     }
 
     private static AwsException assertAws(

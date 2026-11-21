@@ -7,6 +7,7 @@ import com.github.dockerjava.api.command.CreateContainerCmd;
 import com.github.dockerjava.api.command.CreateContainerResponse;
 import com.github.dockerjava.api.command.CreateNetworkCmd;
 import com.github.dockerjava.api.command.DisconnectFromNetworkCmd;
+import com.github.dockerjava.api.command.InfoCmd;
 import com.github.dockerjava.api.command.InspectContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.InspectNetworkCmd;
@@ -18,6 +19,7 @@ import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.ExposedPort;
 import com.github.dockerjava.api.model.HostConfig;
+import com.github.dockerjava.api.model.Info;
 import com.github.dockerjava.api.model.Network;
 import com.github.dockerjava.api.model.NetworkSettings;
 import com.github.dockerjava.api.model.Ports;
@@ -172,6 +174,88 @@ class ContainerLifecycleManagerNetworkTest {
     }
 
     @Test
+    void createAndStartPutsAPublishingContainerOnItsNetworkAloneOnDockerEngine() {
+        daemonRuns("Ubuntu 24.04.1 LTS");
+        when(dockerClient.startContainerCmd("container-id")).thenReturn(mock(StartContainerCmd.class));
+        when(inspectOf("container-id").getNetworkSettings()).thenReturn(mock(NetworkSettings.class));
+
+        manager().createAndStart(spec("floci-net", Map.of(8080, 18080), List.of()));
+
+        HostConfig hostConfig = createdHostConfig();
+        assertEquals("floci-net", hostConfig.getNetworkMode());
+        assertTrue(hostConfig.getPortBindings().getBindings().containsKey(ExposedPort.tcp(8080)));
+        verify(connectCmd, never()).exec();
+    }
+
+    @Test
+    void createAndStartConnectsAPublishingContainerAfterStartOnDockerDesktop() {
+        daemonRuns("Docker Desktop");
+        when(dockerClient.startContainerCmd("container-id")).thenReturn(mock(StartContainerCmd.class));
+        when(inspectOf("container-id").getNetworkSettings()).thenReturn(mock(NetworkSettings.class));
+
+        manager().createAndStart(spec("floci-net", Map.of(8080, 18080), List.of()));
+
+        assertNull(createdHostConfig().getNetworkMode());
+        verify(connectCmd).withNetworkId("floci-net");
+        verify(connectCmd).exec();
+    }
+
+    @Test
+    void createAndStartStillConnectsAPublishingContainerWhenTheDaemonAnswersOnlyAfterCreate() {
+        InfoCmd infoCmd = mock(InfoCmd.class);
+        Info info = mock(Info.class);
+        lenient().when(dockerClient.infoCmd()).thenReturn(infoCmd);
+        lenient().when(infoCmd.exec()).thenThrow(new RuntimeException("daemon busy")).thenReturn(info);
+        lenient().when(info.getOperatingSystem()).thenReturn("Ubuntu 24.04.1 LTS");
+        when(dockerClient.startContainerCmd("container-id")).thenReturn(mock(StartContainerCmd.class));
+        when(inspectOf("container-id").getNetworkSettings()).thenReturn(mock(NetworkSettings.class));
+
+        manager().createAndStart(spec("floci-net", Map.of(8080, 18080), List.of()));
+
+        assertNull(createdHostConfig().getNetworkMode());
+        verify(connectCmd).withNetworkId("floci-net");
+        verify(connectCmd).exec();
+    }
+
+    @Test
+    void createReconnectsAPublishingContainerWithItsLinkLocalEndpointOnDockerEngine() {
+        daemonRuns("Ubuntu 24.04.1 LTS");
+
+        manager().create(specWithLinkLocalIp(Map.of(8080, 18080)));
+
+        assertEquals("test-network", createdHostConfig().getNetworkMode());
+        InOrder order = inOrder(disconnectCmd, connectCmd);
+        order.verify(disconnectCmd).exec();
+        order.verify(connectCmd).exec();
+    }
+
+    @Test
+    void createJoinsTheContainerToItsFurtherNetworksBeforeItStarts() {
+        manager().create(specJoining("steps-network"));
+
+        InOrder order = inOrder(createCmd, connectCmd);
+        order.verify(createCmd).exec();
+        order.verify(connectCmd).withContainerId("container-id");
+        order.verify(connectCmd).withNetworkId("steps-network");
+        order.verify(connectCmd).exec();
+        verify(connectCmd, never()).withContainerNetwork(any());
+        verify(disconnectCmd, never()).exec();
+    }
+
+    @Test
+    void createRemovesTheContainerWhenItCannotJoinAFurtherNetwork() {
+        RemoveContainerCmd removeCmd = mock(RemoveContainerCmd.class, RETURNS_SELF);
+        lenient().when(dockerClient.removeContainerCmd("container-id")).thenReturn(removeCmd);
+        doThrow(new IllegalStateException("network gone")).when(connectCmd).exec();
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> manager().create(specJoining("steps-network")));
+
+        assertTrue(failure.getMessage().contains("steps-network"), failure.getMessage());
+        verify(dockerClient).removeContainerCmd("container-id");
+    }
+
+    @Test
     void createLeavesNetworkAloneWithoutLinkLocalIps() {
         manager().create(new ContainerSpec("busybox:stable"));
 
@@ -217,6 +301,40 @@ class ContainerLifecycleManagerNetworkTest {
         assertEquals(networkMode, hostConfig.getNetworkMode());
         assertNull(hostConfig.getPortBindings());
         verify(connectCmd, never()).exec();
+    }
+
+    /**
+     * Docker refuses an exposed port together with container:<id> network mode, "conflicting
+     * options: port exposing and the container type network mode", which is how a sidecar built
+     * with a dynamic port failed to start inside another container's namespace. No namespace
+     * mode gives the container an endpoint of its own, so none of them takes an exposed port.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"host", "none", "container:sibling"})
+    void createDeclaresNoExposedPortInANamespaceNetworkMode(String networkMode) {
+        manager().create(spec(networkMode, Map.of(8180, 0), List.of(8180)));
+
+        verify(createCmd, never()).withExposedPorts(any(ExposedPort[].class));
+        assertNull(createdHostConfig().getPortBindings());
+    }
+
+    @Test
+    void createAndStartStillAnswersTheEndpointOfAPortItDidNotExposeInANamespace() {
+        when(containerDetector.isRunningInContainer()).thenReturn(true);
+        when(dockerClient.startContainerCmd("container-id")).thenReturn(mock(StartContainerCmd.class));
+        when(inspectOf("container-id").getHostConfig())
+                .thenReturn(HostConfig.newHostConfig().withNetworkMode("container:sibling-id"));
+        InspectContainerResponse owner = inspectOf("sibling-id");
+        NetworkSettings ownerNetworks = mock(NetworkSettings.class);
+        when(owner.getHostConfig()).thenReturn(HostConfig.newHostConfig().withNetworkMode("bridge"));
+        when(owner.getNetworkSettings()).thenReturn(ownerNetworks);
+        when(ownerNetworks.getNetworks())
+                .thenReturn(Map.of("bridge", new ContainerNetwork().withIpv4Address("172.17.0.7")));
+
+        ContainerInfo info = manager().createAndStart(spec("container:sibling", Map.of(8180, 0), List.of(8180)));
+
+        verify(createCmd, never()).withExposedPorts(any(ExposedPort[].class));
+        assertEquals(new EndpointInfo("172.17.0.7", 8180), info.getEndpoint(8180));
     }
 
     @Test
@@ -416,6 +534,14 @@ class ContainerLifecycleManagerNetworkTest {
         return inspect;
     }
 
+    private void daemonRuns(String operatingSystem) {
+        InfoCmd infoCmd = mock(InfoCmd.class);
+        Info info = mock(Info.class);
+        when(dockerClient.infoCmd()).thenReturn(infoCmd);
+        when(infoCmd.exec()).thenReturn(info);
+        when(info.getOperatingSystem()).thenReturn(operatingSystem);
+    }
+
     private HostConfig createdHostConfig() {
         ArgumentCaptor<HostConfig> hostConfig = ArgumentCaptor.forClass(HostConfig.class);
         verify(createCmd).withHostConfig(hostConfig.capture());
@@ -461,6 +587,43 @@ class ContainerLifecycleManagerNetworkTest {
     }
 
     @Test
+    void ensureConnectedJoinsARunningContainerToTheNetworkUnderItsAliasOnlyWhenItIsNotOnIt() {
+        NetworkSettings networks = mock(NetworkSettings.class);
+        when(inspectOf("floci").getNetworkSettings()).thenReturn(networks);
+        when(networks.getNetworks()).thenReturn(Map.of("floci_default", new ContainerNetwork()),
+                Map.of("floci_default", new ContainerNetwork(), "emr-j-1-hdfs", new ContainerNetwork()));
+
+        manager().ensureConnected("floci", "emr-j-1-hdfs", "floci");
+        manager().ensureConnected("floci", "emr-j-1-hdfs", "floci");
+
+        verify(connectCmd).withContainerId("floci");
+        verify(connectCmd).withNetworkId("emr-j-1-hdfs");
+        ArgumentCaptor<ContainerNetwork> endpoint = ArgumentCaptor.forClass(ContainerNetwork.class);
+        verify(connectCmd).withContainerNetwork(endpoint.capture());
+        assertEquals(List.of("floci"), endpoint.getValue().getAliases());
+        // Docker refuses to join a container to a network it is on.
+        verify(connectCmd, times(1)).exec();
+    }
+
+    @Test
+    void disconnectFromNetworkLeavesOnlyANetworkTheContainerIsOnAndSaysWhetherItLeft() {
+        NetworkSettings networks = mock(NetworkSettings.class);
+        when(inspectOf("floci").getNetworkSettings()).thenReturn(networks);
+        when(networks.getNetworks()).thenReturn(Map.of("emr-j-1-hdfs", new ContainerNetwork()));
+
+        assertTrue(manager().disconnectFromNetwork("floci", "emr-j-1-hdfs"));
+        assertTrue(manager().disconnectFromNetwork("floci", "emr-j-2-hdfs"));
+
+        verify(disconnectCmd).withContainerId("floci");
+        verify(disconnectCmd).withNetworkId("emr-j-1-hdfs");
+        verify(disconnectCmd).withForce(true);
+        verify(disconnectCmd, times(1)).exec();
+        // One Docker keeps it on is not left.
+        doThrow(new ConflictException("the daemon is busy")).when(disconnectCmd).exec();
+        assertFalse(manager().disconnectFromNetwork("floci", "emr-j-1-hdfs"));
+    }
+
+    @Test
     void removeNetworkSaysWhetherTheNetworkIsGone() {
         when(dockerClient.removeNetworkCmd("removed")).thenReturn(mock(RemoveNetworkCmd.class));
         RemoveNetworkCmd missing = mock(RemoveNetworkCmd.class);
@@ -476,7 +639,7 @@ class ContainerLifecycleManagerNetworkTest {
     }
 
     private ContainerLifecycleManager manager() {
-        return new ContainerLifecycleManager(dockerClient, imageCacheService, containerDetector, config);
+        return new ContainerLifecycleManager(dockerClient, dockerClient, imageCacheService, containerDetector, config);
     }
 
     private static ContainerSpec spec(String networkMode, Map<Integer, Integer> portBindings,
@@ -494,5 +657,14 @@ class ContainerLifecycleManagerNetworkTest {
                 List.of(), "test-network", List.of(), List.of(), List.of(), List.of(), Map.of(), null,
                 false, null, List.of(), null, null, List.of(), List.of(), null, null, false,
                 List.of(LINK_LOCAL_IP), Map.of(), false);
+    }
+
+    // A container on test-network that joins network too.
+    private static ContainerSpec specJoining(String network) {
+        return new ContainerSpec(
+                "busybox:stable", null, List.of(), null, null, null, Map.of(), List.of(),
+                List.of(), "test-network", List.of(), List.of(), List.of(), List.of(), Map.of(), null,
+                false, null, List.of(), null, null, List.of(), List.of(), null, null, false,
+                List.of(), Map.of(), false, LinuxOptions.NONE, false, null, List.of(network));
     }
 }

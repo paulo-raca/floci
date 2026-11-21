@@ -4,6 +4,10 @@ import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
@@ -23,7 +27,7 @@ class Ec2InstanceTypeCatalogTest {
     Ec2InstanceTypeCatalog instanceTypeCatalog;
 
     @Test
-    void catalogContainsCurrentTypesAndLargeGravitonTypes() {
+    void catalogContainsCurrentTypesAndCapturedInstanceTypes() throws IOException {
         Set<String> instanceTypes = instanceTypeCatalog.instanceTypes().stream()
                 .map(instanceType -> instanceType.instanceType)
                 .collect(Collectors.toSet());
@@ -43,6 +47,7 @@ class Ec2InstanceTypeCatalogTest {
                 "t3a.nano",
                 "m5.large",
                 "r5.large",
+                "i4i.large",
                 "t4g.micro",
                 "t4g.small",
                 "t4g.medium",
@@ -54,13 +59,31 @@ class Ec2InstanceTypeCatalogTest {
                 "m8gd.medium",
                 "m8gd.large",
                 "m8gd.2xlarge"));
-        for (String family : List.of("c6g", "c6gn", "c7g", "c8g", "m6g", "m7g", "m8g")) {
-            for (String size : List.of("medium", "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge")) {
-                expected.add(family + "." + size);
+        for (String resource : List.of("/ec2/graviton-instance-types.csv", "/ec2/x86-instance-types.csv")) {
+            try (BufferedReader rows = new BufferedReader(new InputStreamReader(
+                    getClass().getResourceAsStream(resource), StandardCharsets.UTF_8))) {
+                rows.lines().skip(1)
+                        .filter(row -> !row.isBlank() && !row.startsWith("#"))
+                        .map(row -> row.substring(0, row.indexOf(',')))
+                        .forEach(expected::add);
             }
         }
-        expected.addAll(List.of("c8g.24xlarge", "c8g.48xlarge", "m8g.24xlarge", "m8g.48xlarge"));
         assertEquals(expected, instanceTypes);
+    }
+
+    @Test
+    void storageOptimizedI4iLargeHasItsDocumentedCapacity() {
+        Ec2InstanceTypeCatalog.CatalogInstanceType i4iLarge = instanceTypeCatalog.find("i4i.large").orElseThrow();
+        assertEquals(2, i4iLarge.vcpu);
+        assertEquals(16384, i4iLarge.memoryMib);
+        assertEquals(468, i4iLarge.localStorageGiB);
+        assertEquals(List.of("x86_64"), i4iLarge.supportedArchitectures);
+        assertEquals("Intel", i4iLarge.processorManufacturer);
+        assertTrue(i4iLarge.encryptionInTransitSupported);
+        assertEquals(10, i4iLarge.ipv4AddressesPerInterface);
+        assertEquals(3, i4iLarge.networkCards.get(0).maximumNetworkInterfaces);
+        assertTrue(Boolean.TRUE.equals(i4iLarge.toResponseMap().get("instanceStorageSupported")),
+                "i4i.large must report instance storage support");
     }
 
     @Test

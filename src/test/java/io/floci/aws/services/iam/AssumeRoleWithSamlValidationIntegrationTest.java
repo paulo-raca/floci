@@ -22,6 +22,7 @@ import software.amazon.awssdk.auth.credentials.AnonymousCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.iam.IamClient;
 import software.amazon.awssdk.services.iam.model.IamException;
+import software.amazon.awssdk.services.iam.model.Role;
 import software.amazon.awssdk.services.sts.StsClient;
 import software.amazon.awssdk.services.sts.model.AssumeRoleWithSamlResponse;
 import software.amazon.awssdk.services.sts.model.StsException;
@@ -64,6 +65,7 @@ import java.util.function.Function;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.endsWith;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.startsWith;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -235,6 +237,64 @@ class AssumeRoleWithSamlValidationIntegrationTest {
                 .statusCode(403).body(containsString("AccessDenied"));
     }
 
+    /**
+     * "You can use an Attribute element with the Name attribute set to
+     * https://aws.amazon.com/SAML/Attributes/RoleSessionName. This element contains one
+     * AttributeValue element that provides an identifier for the temporary credentials that are
+     * issued when the role is assumed." It names the session, and it is the {@code sts:RoleSessionName}
+     * a trust policy reads, which the Service Authorization Reference lists for
+     * {@code sts:AssumeRoleWithSAML}.
+     */
+    @Test
+    void trustPolicyRequiringTheSessionNameAllowsTheAssertionThatCarriesIt() {
+        String role = createRoleWithCondition("{\"StringEquals\":{\"sts:RoleSessionName\":\"alice@example.test\"}}");
+        assume(role, assertionNamingSession(role, "alice@example.test"), PROVIDER)
+                .statusCode(200)
+                .body("AssumeRoleWithSAMLResponse.AssumeRoleWithSAMLResult.AssumedRoleUser.Arn",
+                        equalTo("arn:aws:sts::" + ACCOUNT + ":assumed-role/" + role.substring(role.lastIndexOf('/') + 1)
+                                + "/alice@example.test"))
+                .body("AssumeRoleWithSAMLResponse.AssumeRoleWithSAMLResult.AssumedRoleUser.AssumedRoleId",
+                        endsWith(":alice@example.test"));
+    }
+
+    @Test
+    void trustPolicyRequiringTheSessionNameRefusesAnotherName() {
+        String role = createRoleWithCondition("{\"StringEquals\":{\"sts:RoleSessionName\":\"alice@example.test\"}}");
+        assume(role, assertionNamingSession(role, "mallory"), PROVIDER)
+                .statusCode(403).body(containsString("AccessDenied"));
+    }
+
+    @Test
+    void trustPolicyRequiringTheSessionNameRefusesAnAssertionWithoutOne() {
+        String role = createRoleWithCondition("{\"StringEquals\":{\"sts:RoleSessionName\":\"alice@example.test\"}}");
+        assume(role, assertion(role, PROVIDER, Instant.now().plusSeconds(300), AUDIENCE, ISSUER, true), PROVIDER)
+                .statusCode(403).body(containsString("AccessDenied"));
+    }
+
+    @Test
+    void theSessionNameAttributeNamesTheSessionWithoutACondition() {
+        String role = createRole(true);
+        assume(role, assertionNamingSession(role, "bob"), PROVIDER)
+                .statusCode(200)
+                .body("AssumeRoleWithSAMLResponse.AssumeRoleWithSAMLResult.AssumedRoleUser.Arn", endsWith("/bob"));
+    }
+
+    /**
+     * "Error: RoleSessionName in AuthnResponse must match [a-zA-Z_0-9+=,.@-]{2,64} (service:
+     * AWSSecurityTokenService; status code: 400; error code: InvalidIdentityToken)".
+     */
+    @Test
+    void aSessionNameAttributeOutsideItsPatternIsRejected() {
+        String role = createRole(true);
+        assume(role, assertionNamingSession(role, "has space"), PROVIDER)
+                .statusCode(400)
+                .body("ErrorResponse.Error.Code", equalTo("InvalidIdentityToken"))
+                .body("ErrorResponse.Error.Message",
+                        equalTo("RoleSessionName in AuthnResponse must match [a-zA-Z_0-9+=,.@-]{2,64}"));
+        assume(role, assertionNamingSession(role, "a".repeat(65)), PROVIDER)
+                .statusCode(400).body("ErrorResponse.Error.Code", equalTo("InvalidIdentityToken"));
+    }
+
     @Test
     void duplicateProviderCreationIsRejected() {
         String metadata = SamlMetadata.forEntity(ISSUER, certificateBase64);
@@ -383,8 +443,8 @@ class AssumeRoleWithSamlValidationIntegrationTest {
                 String trust = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
                         + "\"Principal\":{\"Federated\":\"" + providerArn
                         + "\"},\"Action\":\"sts:AssumeRoleWithSAML\"}]}";
-                roleArn = client.createRole(b -> b.roleName(name).assumeRolePolicyDocument(trust)
-                        .maxSessionDuration(maximum)).role().arn();
+                roleArn = client.createRole(b -> b.roleName(name).path("/teams/saml/").assumeRolePolicyDocument(trust)
+                        .maxSessionDuration(maximum).tags(tag -> tag.key("team").value("federated"))).role().arn();
             } catch (RuntimeException | Error failure) {
                 try {
                     close();
@@ -402,6 +462,8 @@ class AssumeRoleWithSamlValidationIntegrationTest {
                     .principalArn(providerArn).durationSeconds(duration)
                     .samlAssertion(assertion(roleArn, providerArn, expiry, AUDIENCE, ISSUER, sign)));
             sessions.add(response.credentials().accessKeyId());
+            Role role = client.getRole(b -> b.roleName(name)).role();
+            FederatedSessionAssertions.assertIdentity(endpoint, iamService, role, "saml-subject", response);
             return response;
         }
 
@@ -505,6 +567,18 @@ class AssumeRoleWithSamlValidationIntegrationTest {
         return "arn:aws:iam::" + ACCOUNT + ":role/" + role;
     }
 
+    private static String createRoleWithCondition(String condition) {
+        String role = "saml-session-" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+        String trust = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Federated\":\""
+                + PROVIDER + "\"},\"Action\":\"sts:AssumeRoleWithSAML\",\"Condition\":" + condition + "}]}";
+        given().contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "CreateRole").formParam("RoleName", role)
+                .formParam("AssumeRolePolicyDocument", trust)
+                .header("Authorization", auth("iam")).when().post("/").then().statusCode(200);
+        ensureProviderRegistered();
+        return "arn:aws:iam::" + ACCOUNT + ":role/" + role;
+    }
+
     private static void ensureProviderRegistered() {
         if (!providerRegistered) {
             registerProvider();
@@ -543,6 +617,22 @@ class AssumeRoleWithSamlValidationIntegrationTest {
     private static String assertion(String role, String provider, Instant expiry, String audience,
                                     String issuer, boolean sign, boolean unrelatedConfirmation,
                                     Function<XMLSignatureFactory, List<Transform>> transforms) {
+        return assertion(role, provider, expiry, audience, issuer, sign, unrelatedConfirmation, transforms, null);
+    }
+
+    /** A valid signed assertion for {@code role} that names its session {@code roleSessionName}. */
+    private static String assertionNamingSession(String role, String roleSessionName) {
+        return assertion(role, PROVIDER, Instant.now().plusSeconds(300), AUDIENCE, ISSUER, true, false,
+                factory -> List.of(enveloped(factory)), roleSessionName);
+    }
+
+    private static String assertion(String role, String provider, Instant expiry, String audience,
+                                    String issuer, boolean sign, boolean unrelatedConfirmation,
+                                    Function<XMLSignatureFactory, List<Transform>> transforms,
+                                    String roleSessionName) {
+        String sessionNameAttribute = roleSessionName == null ? ""
+                : "<saml:Attribute Name=\"https://aws.amazon.com/SAML/Attributes/RoleSessionName\"><saml:AttributeValue>"
+                        + roleSessionName + "</saml:AttributeValue></saml:Attribute>";
         String id = "_" + UUID.randomUUID();
         String extraConfirmation = unrelatedConfirmation
                 ? "<saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:sender-vouches\"><saml:SubjectConfirmationData Recipient=\"https://unrelated.example.test\" NotOnOrAfter=\"" + Instant.now().minusSeconds(1) + "\"/></saml:SubjectConfirmation>"
@@ -551,7 +641,8 @@ class AssumeRoleWithSamlValidationIntegrationTest {
                 + Instant.now() + "\"><saml:Issuer>" + issuer + "</saml:Issuer><saml:Subject><saml:NameID Format=\"persistent\">saml-subject</saml:NameID>"
                 + extraConfirmation + "<saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\"><saml:SubjectConfirmationData Recipient=\"https://signin.aws.amazon.com/saml\" NotOnOrAfter=\"" + expiry + "\"/></saml:SubjectConfirmation></saml:Subject>"
                 + "<saml:Conditions NotBefore=\"" + Instant.now().minusSeconds(30) + "\" NotOnOrAfter=\"" + expiry + "\"><saml:AudienceRestriction><saml:Audience>" + audience + "</saml:Audience></saml:AudienceRestriction></saml:Conditions>"
-                + "<saml:AttributeStatement><saml:Attribute Name=\"https://aws.amazon.com/SAML/Attributes/Role\"><saml:AttributeValue>" + role + "," + provider + "</saml:AttributeValue></saml:Attribute></saml:AttributeStatement></saml:Assertion>";
+                + "<saml:AttributeStatement><saml:Attribute Name=\"https://aws.amazon.com/SAML/Attributes/Role\"><saml:AttributeValue>" + role + "," + provider + "</saml:AttributeValue></saml:Attribute>" + sessionNameAttribute
+                + "</saml:AttributeStatement></saml:Assertion>";
         try {
             Document document = XmlParser.parseDocument(xml);
             if (!sign) {

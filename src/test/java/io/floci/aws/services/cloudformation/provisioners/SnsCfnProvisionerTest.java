@@ -10,6 +10,8 @@ import io.floci.aws.services.sns.model.Subscription;
 import io.floci.aws.services.sns.model.Topic;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.ArgumentCaptor;
 
 import java.util.ArrayList;
@@ -26,8 +28,11 @@ import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
@@ -79,6 +84,8 @@ class SnsCfnProvisionerTest {
                 .thenAnswer(i -> new SnsService.SubscriptionCreation(
                         sns.subscribe(i.getArgument(0), i.getArgument(1), i.getArgument(2), i.getArgument(3),
                                 i.getArgument(4)), true));
+        when(sns.subscribe(anyString(), anyString(), anyString(), anyString(), anyMap()))
+                .thenReturn(subscription("arn:prior"));
         ctx = new ProvisionContext(engine, REGION, "000000000000", "my-stack");
     }
 
@@ -409,27 +416,27 @@ class SnsCfnProvisionerTest {
                 "a standard topic must not be renamed into a FIFO one");
     }
 
-    /**
-     * Replacing would displace a topic nothing cleans up, subscriptions included, so it is refused.
-     */
+    /** A custom-named topic cannot be replaced under the same name, so turning it FIFO is refused. */
     @Test
-    void aTopicTurningFifoIsRejectedRatherThanReplaced() {
+    void aNamedTopicTurningFifoIsRefusedAsACustomNamedReplacement() {
         StackResource r = new StackResource();
         r.setLogicalId("Topic");
         r.setResourceType("AWS::SNS::Topic");
-        r.setAttributes(new HashMap<>(Map.of("TopicName", "my-stack-Topic-abc123def456")));
+        r.setAttributes(new HashMap<>(Map.of("TopicName", "events")));
         r.setPhysicalId(TOPIC_ARN);
-        ProvisionContext update =
-                new ProvisionContext(ctx.engine(), REGION, "000000000000", "my-stack", TOPIC_ARN);
+        ProvisionContext update = new ProvisionContext(ctx.engine(), REGION, "000000000000", "my-stack",
+                TOPIC_ARN, e -> { }, props("""
+                {"TopicName": "events"}
+                """));
         JsonNode turningFifo = props("""
-                {"FifoTopic": true}
+                {"TopicName": "events", "FifoTopic": true}
                 """);
 
         AwsException e = assertThrows(AwsException.class,
                 () -> provisioner.provision(r, turningFifo, update));
 
         assertEquals("ValidationError", e.getErrorCode());
-        assertTrue(e.getMessage().contains("requires resource replacement"), e.getMessage());
+        assertTrue(e.getMessage().contains("custom-named"), e.getMessage());
         verify(sns, never()).createTopic(anyString(), anyMap(), anyMap(), anyString());
     }
 
@@ -502,6 +509,58 @@ class SnsCfnProvisionerTest {
                 anyString(), anyString());
     }
 
+    @Test
+    void displayNameIsForwardedOnlyWhenSet() {
+        ArgumentCaptor<Map<String, String>> attrs = ArgumentCaptor.forClass(Map.class);
+        when(sns.createTopic(anyString(), attrs.capture(), anyMap(), anyString())).thenReturn(topic(TOPIC_ARN));
+
+        provision("AWS::SNS::Topic", """
+                {"TopicName": "events", "DisplayName": "Expected Name"}
+                """);
+        assertEquals("Expected Name", attrs.getValue().get("DisplayName"));
+
+        setUp();
+        ArgumentCaptor<Map<String, String>> plain = ArgumentCaptor.forClass(Map.class);
+        when(sns.createTopic(anyString(), plain.capture(), anyMap(), anyString())).thenReturn(topic(TOPIC_ARN));
+        provision("AWS::SNS::Topic", """
+                {"TopicName": "events"}
+                """);
+        assertFalse(plain.getValue().containsKey("DisplayName"));
+    }
+
+    @Test
+    void anUpdateThatDropsDisplayNameClearsItButContinuedOmissionDoesNot() {
+        when(sns.createTopic(eq("events"), anyMap(), anyMap(), eq(REGION))).thenReturn(topic(TOPIC_ARN));
+
+        provisionUpdate("""
+                {"TopicName": "events", "DisplayName": "Expected Name"}
+                """, """
+                {"TopicName": "events"}
+                """);
+        verify(sns).setTopicAttributes(TOPIC_ARN, "DisplayName", "", REGION);
+
+        setUp();
+        when(sns.createTopic(eq("events"), anyMap(), anyMap(), eq(REGION))).thenReturn(topic(TOPIC_ARN));
+        provisionUpdate("""
+                {"TopicName": "events"}
+                """, """
+                {"TopicName": "events"}
+                """);
+        verify(sns, never()).setTopicAttributes(anyString(), eq("DisplayName"), anyString(), anyString());
+    }
+
+    @Test
+    void displayNameOverOneHundredCharactersIsRejectedBeforeAnythingIsCreated() {
+        String atLimit = "x".repeat(100);
+        when(sns.createTopic(anyString(), anyMap(), anyMap(), anyString())).thenReturn(topic(TOPIC_ARN));
+        provision("AWS::SNS::Topic", "{\"TopicName\": \"events\", \"DisplayName\": \"" + atLimit + "\"}");
+
+        setUp();
+        assertThrows(AwsException.class, () -> provision("AWS::SNS::Topic",
+                "{\"TopicName\": \"events\", \"DisplayName\": \"" + atLimit + "x\"}"));
+        verify(sns, never()).createTopic(anyString(), anyMap(), anyMap(), anyString());
+    }
+
     /** Real SNS rejects both attributes on a standard topic, so an update must not invent them. */
     @Test
     void aStandardTopicUpdateWritesNoFifoDefaults() {
@@ -516,6 +575,10 @@ class SnsCfnProvisionerTest {
 
     /** Provisions an existing topic again, the way UpdateStack re-invokes the provisioner. */
     private void provisionUpdate(String json) {
+        provisionUpdate(null, json);
+    }
+
+    private void provisionUpdate(String priorJson, String json) {
         StackResource r = new StackResource();
         r.setLogicalId("Topic");
         r.setResourceType("AWS::SNS::Topic");
@@ -523,8 +586,9 @@ class SnsCfnProvisionerTest {
         String priorName = resolved.path("TopicName").asText(null);
         r.setAttributes(new HashMap<>(Map.of("TopicName", priorName)));
         r.setPhysicalId(TOPIC_ARN);
+        JsonNode prior = priorJson == null ? null : props(priorJson);
         provisioner.provision(r, resolved,
-                new ProvisionContext(ctx.engine(), REGION, "000000000000", "my-stack", TOPIC_ARN));
+                new ProvisionContext(ctx.engine(), REGION, "000000000000", "my-stack", TOPIC_ARN, null, prior));
     }
 
     @Test
@@ -544,6 +608,39 @@ class SnsCfnProvisionerTest {
         // createTopic returns the existing topic, so without this a changed scope would be lost.
         verify(sns).setTopicAttributes(TOPIC_ARN, "FifoThroughputScope", "MessageGroup", REGION);
         verify(sns).setTopicAttributes(TOPIC_ARN, "ContentBasedDeduplication", "true", REGION);
+    }
+
+    @Test
+    void firehoseSubscriptionForwardsTheResolvedRoleArn() {
+        String roleArn = "arn:aws:iam::000000000000:role/sns-firehose";
+        JsonNode properties = props("""
+                {"TopicArn":"t","Protocol":"firehose","Endpoint":"e",
+                 "SubscriptionRoleArn":{"Fn::GetAtt":["Role","Arn"]}}
+                """);
+        when(engine.resolve(properties.path("SubscriptionRoleArn"))).thenReturn(roleArn);
+        when(sns.subscribe(eq("t"), eq("firehose"), eq("e"), eq(REGION), anyMap()))
+                .thenReturn(subscription("arn:sub"));
+        StackResource resource = new StackResource();
+        resource.setResourceType("AWS::SNS::Subscription");
+        resource.setAttributes(new HashMap<>());
+
+        provisioner.provision(resource, properties, ctx);
+
+        verify(sns).subscribe("t", "firehose", "e", REGION, Map.of("SubscriptionRoleArn", roleArn));
+        assertEquals("arn:sub", resource.getPhysicalId());
+        assertEquals("arn:sub", resource.getAttributes().get("Arn"));
+    }
+
+    @Test
+    void nullSubscriptionRoleArnIsNotForwarded() {
+        when(sns.subscribe(eq("t"), eq("sqs"), eq("e"), eq(REGION), anyMap()))
+                .thenReturn(subscription("arn:sub"));
+
+        provision("AWS::SNS::Subscription", """
+                {"TopicArn":"t","Protocol":"sqs","Endpoint":"e","SubscriptionRoleArn":null}
+                """);
+
+        verify(sns).subscribe("t", "sqs", "e", REGION, Map.of());
     }
 
     @Test
@@ -625,6 +722,147 @@ class SnsCfnProvisionerTest {
     }
 
     @Test
+    void subscriptionUpdateSetsMutableAttributesOnThePriorIdentity() {
+        StackResource resource = existingSubscription();
+        when(sns.getSubscriptionAttributes("arn:prior", REGION))
+                .thenReturn(Map.of("TopicArn", "t", "Protocol", "sqs", "Endpoint", "e"));
+
+        provisioner.provision(resource, props("""
+                {"TopicArn":"t","Protocol":"sqs","Endpoint":"e","FilterPolicy":{"kind":["updated"]},
+                 "RawMessageDelivery":true,"FilterPolicyScope":"MessageBody",
+                 "RedrivePolicy":{"deadLetterTargetArn":"arn:dlq"}}
+                """), subscriptionUpdate(null));
+
+        verify(sns, never()).subscribe(anyString(), anyString(), anyString(), anyString(), anyMap());
+        verify(sns).setSubscriptionAttribute("arn:prior", "FilterPolicy", "{\"kind\":[\"updated\"]}", REGION);
+        verify(sns).setSubscriptionAttribute("arn:prior", "RawMessageDelivery", "true", REGION);
+        verify(sns).setSubscriptionAttribute("arn:prior", "FilterPolicyScope", "MessageBody", REGION);
+        verify(sns).setSubscriptionAttribute("arn:prior", "RedrivePolicy", "{\"deadLetterTargetArn\":\"arn:dlq\"}", REGION);
+        assertEquals("arn:prior", resource.getPhysicalId());
+        assertEquals("arn:prior", resource.getAttributes().get("Arn"));
+    }
+
+    @Test
+    void subscriptionUpdateResetsDroppedDeclaredProperties() {
+        when(sns.getSubscriptionAttributes("arn:prior", REGION))
+                .thenReturn(Map.of("TopicArn", "t", "Protocol", "sqs", "Endpoint", "e"));
+
+        provisioner.provision(existingSubscription(), props("""
+                {"TopicArn":"t","Protocol":"sqs","Endpoint":"e"}
+                """), subscriptionUpdate(props("""
+                {"TopicArn":"t","Protocol":"sqs","Endpoint":"e",
+                 "FilterPolicy":{"kind":["created"]},"RawMessageDelivery":true,
+                 "FilterPolicyScope":"MessageBody","RedrivePolicy":{"deadLetterTargetArn":"arn:dlq"}}
+                """)));
+
+        verify(sns).setSubscriptionAttribute("arn:prior", "FilterPolicy", "", REGION);
+        verify(sns).setSubscriptionAttribute("arn:prior", "RawMessageDelivery", "false", REGION);
+        verify(sns).setSubscriptionAttribute("arn:prior", "FilterPolicyScope", "MessageAttributes", REGION);
+        verify(sns).setSubscriptionAttribute("arn:prior", "RedrivePolicy", "", REGION);
+        verify(sns, never()).setSubscriptionAttribute(anyString(), eq("SubscriptionRoleArn"), anyString(), anyString());
+    }
+
+    @Test
+    void subscriptionUpdatePreservesUndeclaredExternalAttributes() {
+        when(sns.getSubscriptionAttributes("arn:prior", REGION))
+                .thenReturn(Map.of("TopicArn", "t", "Protocol", "sqs", "Endpoint", "e",
+                        "FilterPolicy", "{\"kind\":[\"external\"]}"));
+
+        provisioner.provision(existingSubscription(), props("""
+                {"TopicArn":"t","Protocol":"sqs","Endpoint":"e"}
+                """), subscriptionUpdate(props("""
+                {"TopicArn":"t","Protocol":"sqs","Endpoint":"e"}
+                """)));
+
+        verify(sns, never()).setSubscriptionAttribute(anyString(), anyString(), anyString(), anyString());
+        verify(sns, never()).subscribe(anyString(), anyString(), anyString(), anyString(), anyMap());
+    }
+
+    @Test
+    void subscriptionReplacementStillUsesSubscribeValidation() {
+        when(sns.getSubscriptionAttributes("arn:prior", REGION))
+                .thenReturn(Map.of("TopicArn", "t", "Protocol", "sqs", "Endpoint", "e"));
+        when(sns.subscribe("t", "sqs", "replacement", REGION, Map.of("RawMessageDelivery", "true")))
+                .thenReturn(subscription("arn:replacement"));
+        StackResource resource = existingSubscription();
+
+        provisioner.provision(resource, props("""
+                {"TopicArn":"t","Protocol":"sqs","Endpoint":"replacement","RawMessageDelivery":true}
+                """), subscriptionUpdate(props("""
+                {"TopicArn":"t","Protocol":"sqs","Endpoint":"e"}
+                """)));
+
+        assertEquals("arn:replacement", resource.getPhysicalId());
+        verify(sns).subscribe("t", "sqs", "replacement", REGION, Map.of("RawMessageDelivery", "true"));
+        verify(sns, never()).setSubscriptionAttribute(anyString(), anyString(), anyString(), anyString());
+
+        // A replacement that only adopted a subscription somebody else made is not unsubscribed on rollback.
+        doReturn(new SnsService.SubscriptionCreation(subscription("arn:adopted"), false))
+                .when(sns).subscribeWithStatus("t", "sqs", "adopted", REGION, Map.of());
+        StackResource adopting = existingSubscription();
+        provisioner.provision(adopting, props("""
+                {"TopicArn":"t","Protocol":"sqs","Endpoint":"adopted"}
+                """), subscriptionUpdate(props("""
+                {"TopicArn":"t","Protocol":"sqs","Endpoint":"e"}
+                """)));
+        assertEquals("arn:adopted", adopting.getPhysicalId());
+        assertTrue(provisioner.rollbackUpdate(adopting));
+
+        assertEquals("arn:prior", adopting.getPhysicalId());
+        verify(sns, never()).unsubscribe(anyString(), anyString());
+    }
+
+    @Test
+    void missingPriorSubscriptionDoesNotAdoptAnotherCallersSubscription() {
+        when(sns.getSubscriptionAttributes("arn:prior", REGION))
+                .thenThrow(new AwsException("NotFound", "Subscription does not exist.", 404));
+        StackResource resource = existingSubscription();
+
+        AwsException error = assertThrows(AwsException.class, () -> provisioner.provision(resource, props("""
+                {"TopicArn":"t","Protocol":"sqs","Endpoint":"e","RawMessageDelivery":true}
+                """), subscriptionUpdate(null)));
+
+        assertEquals("NotFound", error.getErrorCode());
+        assertEquals("arn:prior", resource.getPhysicalId());
+        verify(sns, never()).subscribe(anyString(), anyString(), anyString(), anyString(), anyMap());
+        verify(sns, never()).setSubscriptionAttribute(anyString(), anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void removedFirehoseRoleFailsBeforeOtherAttributesChange() {
+        when(sns.getSubscriptionAttributes("arn:prior", REGION))
+                .thenReturn(Map.of("TopicArn", "t", "Protocol", "firehose", "Endpoint", "e"));
+        doThrow(new AwsException("InvalidParameter", "A role is required.", 400)).when(sns)
+                .setSubscriptionAttribute("arn:prior", "SubscriptionRoleArn", "", REGION);
+        StackResource resource = existingSubscription();
+
+        AwsException error = assertThrows(AwsException.class, () -> provisioner.provision(resource, props("""
+                {"TopicArn":"t","Protocol":"firehose","Endpoint":"e","RawMessageDelivery":true}
+                """), subscriptionUpdate(props("""
+                {"TopicArn":"t","Protocol":"firehose","Endpoint":"e",
+                 "SubscriptionRoleArn":"arn:aws:iam::000000000000:role/previous"}
+                """))));
+
+        assertEquals("InvalidParameter", error.getErrorCode());
+        assertEquals("arn:prior", resource.getPhysicalId());
+        verify(sns, never()).setSubscriptionAttribute(anyString(), eq("RawMessageDelivery"), anyString(), anyString());
+    }
+
+    private static StackResource existingSubscription() {
+        StackResource resource = new StackResource();
+        resource.setLogicalId("Sub");
+        resource.setResourceType("AWS::SNS::Subscription");
+        resource.setPhysicalId("arn:prior");
+        resource.setAttributes(new HashMap<>(Map.of("Arn", "arn:prior")));
+        return resource;
+    }
+
+    private ProvisionContext subscriptionUpdate(JsonNode priorProperties) {
+        return new ProvisionContext(engine, REGION, "000000000000", "my-stack", "arn:prior",
+                event -> { }, priorProperties);
+    }
+
+    @Test
     void topicPolicyWritesTheDocumentToEveryListedTopic() {
         StackResource r = provision("AWS::SNS::TopicPolicy", """
                 {"Topics": ["arn:aws:sns:us-east-1:000000000000:a", "arn:aws:sns:us-east-1:000000000000:b"],
@@ -690,5 +928,44 @@ class SnsCfnProvisionerTest {
         // A topic policy has no entity of its own, so its delete touches nothing.
         provisioner.delete("AWS::SNS::TopicPolicy", "topic-policy-abc12345", REGION);
         verifyNoMoreInteractions(sns);
+    }
+
+    /**
+     * A replacing update that a later resource fails points the topic back to the old ARN with the old
+     * inline-subscription marker, and deletes the new topic only when this update created it.
+     */
+    @ParameterizedTest(name = "{0}")
+    @CsvSource(delimiter = '|', textBlock = """
+            unnamed topic turning FIFO | my-stack-Topic-abc123 | {"FifoTopic": false, "Subscription": [SUB]} | {"FifoTopic": true, "Subscription": [SUB]} | true | 1
+            rename onto a topic outside the stack | old | {"TopicName": "old", "Subscription": [SUB]} | {"TopicName": "taken", "Subscription": [SUB]} | false | 0
+            """)
+    void aRolledBackTopicReplacementRestoresTheOldTopicAndDeletesOnlyWhatItCreated(
+            String label, String priorName, String priorJson, String newJson, boolean created, int deletes) {
+        String oldArn = "arn:aws:sns:us-east-1:000000000000:" + priorName;
+        String newArn = "arn:aws:sns:us-east-1:000000000000:replacement";
+        String marker = "__FlociInlineSubscription:arn:old-sub";
+        String sub = "{\"Protocol\": \"lambda\", \"Endpoint\": \"arn:lambda\"}";
+        StackResource r = new StackResource();
+        r.setLogicalId("Topic");
+        r.setResourceType("AWS::SNS::Topic");
+        r.setPhysicalId(oldArn);
+        r.setAttributes(new HashMap<>(Map.of("TopicName", priorName, "TopicArn", oldArn, "Arn", oldArn,
+                marker, "true")));
+        doReturn(new SnsService.TopicCreation(topic(newArn), created))
+                .when(sns).createTopicWithStatus(anyString(), anyMap(), anyMap(), eq(REGION));
+        doReturn(subscription("arn:new-sub")).when(sns).subscribe(eq(newArn), anyString(), anyString(),
+                eq(REGION), anyMap());
+        ProvisionContext update = new ProvisionContext(ctx.engine(), REGION, "000000000000", "my-stack",
+                oldArn, e -> { }, props(priorJson.replace("SUB", sub)));
+
+        provisioner.provision(r, props(newJson.replace("SUB", sub)), update);
+        assertEquals(newArn, r.getPhysicalId(), label);
+        assertTrue(provisioner.rollbackUpdate(r), label);
+
+        assertEquals(oldArn, r.getPhysicalId(), label);
+        assertEquals(priorName, r.getAttributes().get("TopicName"), label);
+        assertEquals("true", r.getAttributes().get(marker), label);
+        verify(sns, times(deletes)).deleteTopic(newArn, REGION);
+        verify(sns, times(deletes)).deleteTopic(anyString(), eq(REGION));
     }
 }

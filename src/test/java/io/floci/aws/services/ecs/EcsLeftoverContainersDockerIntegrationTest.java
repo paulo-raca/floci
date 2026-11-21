@@ -12,6 +12,7 @@ import io.floci.aws.services.ecs.model.LaunchType;
 import io.floci.aws.services.ecs.model.NetworkMode;
 import io.floci.aws.services.ecs.model.TaskDefinition;
 import io.floci.aws.testing.TestImages;
+import io.floci.aws.testing.ValidateSignaturesProfile;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import jakarta.inject.Inject;
@@ -19,11 +20,13 @@ import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
+import static io.floci.aws.testing.EcsTaskWaits.awaitLastStatus;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -37,7 +40,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * and tells this run's containers from a previous run's by the run label rather than by time.
  */
 @QuarkusTest
-@TestProfile(EcsServiceDiscoveryDockerIntegrationTest.DockerEcsProfile.class)
+@TestProfile(ValidateSignaturesProfile.class)
 class EcsLeftoverContainersDockerIntegrationTest {
 
     private static final String REGION = "us-east-1";
@@ -77,8 +80,12 @@ class EcsLeftoverContainersDockerIntegrationTest {
         String foreignId = null;
         String previousRunId = null;
         try {
-            String taskContainerId = task.getContainers().getFirst().getDockerId();
-            assertNotNull(taskContainerId, "the task must have started a container: " + task.getStoppedReason());
+            // RunTask answers before the launch; wait for it to land the task RUNNING or STOPPED.
+            EcsTask launched = awaitLastStatus(
+                    () -> ecsService.describeTasks(clusterName, List.of(task.getTaskArn()), REGION).getFirst(),
+                    EcsTask::getLastStatus, Duration.ofMinutes(2), "RUNNING", "STOPPED");
+            String taskContainerId = launched.getContainers().getFirst().getDockerId();
+            assertNotNull(taskContainerId, "the task must have started a container: " + launched.getStoppedReason());
             assertEquals(ContainerStorageHelper.ownerIdentity(config), labels(taskContainerId)
                     .get(ContainerStorageHelper.OWNER_LABEL), "a task container must carry its owner");
 

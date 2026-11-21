@@ -170,17 +170,17 @@ jobs:
         github.event.pull_request.state != 'closed' &&
         github.event.action != 'edited'
       )
-    # Both published architectures. The native image is the only place an
-    # arch-specific resource can go missing (snappy-java's JNI library is
-    # registered per platform), and one arch cannot prove the other.
+    # arm64 only. The native image is the only place an arch-specific resource can go missing
+    # (snappy-java's JNI library is registered per platform), and one arch cannot prove the other,
+    # but an amd64 build here cost 7 to 9 minutes of every run for one 2-minute suite. The amd64
+    # image is proven instead by compat-partitions.yml's amd64 job, after each Nightly, against the
+    # published multi-arch nightly image.
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: arm64
             runner: ubuntu-24.04-arm
-          - arch: amd64
-            runner: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -210,6 +210,13 @@ jobs:
           key: maven-${{ runner.os }}-${{ hashFiles('pom.xml') }}
           restore-keys: maven-${{ runner.os }}-
 
+      # The Maven distribution ./mvnw runs, saved by ci.yml on main, so this job does not fetch it from
+      # Maven Central with the wrapper's one unretried wget.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.m2/wrapper
+          key: maven-wrapper-${{ runner.os }}-${{ hashFiles('.mvn/wrapper/maven-wrapper.properties') }}
+
       - name: Build native executable (quick build)
         # Quarkus 3.39 switches on -H:+AOTSingleCallsiteInline for Mandrel 25.0.4+. The generated
         # REST invokers for AwsQueryController.dispatch and AwsJson11Controller.handle are each the
@@ -218,7 +225,7 @@ jobs:
         # The flag only exists on Mandrel, so it is passed here rather than in application.yml.
         # maven.test.skip rather than skipTests: skipTests only stops surefire, so the build still
         # compiled all of src/test (about 25s per arch) for a native image that never uses it.
-        run: mvn clean package -Dnative -Dmaven.test.skip=true -B -Dquarkus.native.additional-build-args-append="-Ob,-H:-AOTSingleCallsiteInline"
+        run: ./mvnw clean package -Dnative -Dmaven.test.skip=true -B -Dquarkus.native.additional-build-args-append="-Ob,-H:-AOTSingleCallsiteInline"
 
       # Quarkus always writes GraalVM's build-output JSON next to the native source jar. Surfacing
       # it here gives every PR a size record for both architectures: code area, image heap, total
@@ -292,14 +299,11 @@ jobs:
     needs: build-native
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
-    # The suites run against the arm64 image only. What they check is
-    # arch-neutral, and running all eight on both arches (16 jobs per PR) left
-    # them queued for the shared runner pools for longer than they take to run.
-    # The amd64 image is still built above so both published arches are proven
-    # to link and package, and one amd64 suite stays: sdk-test-python carries
-    # the Firehose compression delivery test that proves the x86_64 snappy JNI
-    # library survived the native build (the resource that can go missing per
-    # platform, see the build-native comment).
+    # The suites run against the arm64 image only. What they check is arch-neutral, and running all
+    # eight on both arches (16 jobs per PR) left them queued for the shared runner pools for longer
+    # than they take to run. The x86_64 snappy JNI library (the resource that can go missing per
+    # platform, see the build-native comment) is checked after each Nightly by compat-partitions.yml's
+    # amd64 sdk-test-python job, which carries the Firehose compression delivery test.
     strategy:
       fail-fast: false
       matrix:
@@ -317,9 +321,6 @@ jobs:
         include:
           - arch: arm64
             runner: ubuntu-24.04-arm
-          - arch: amd64
-            test: sdk-test-python
-            runner: ubuntu-latest
 
     steps:
       - name: Download native floci image
@@ -331,24 +332,37 @@ jobs:
       - name: Load native floci image
         run: gunzip -c /tmp/floci-native-image.tar.gz | docker load
 
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            compatibility-tests
+            .github/ci
+            src/main/resources
+
       # The suite makes Floci pull ~30 images on a fresh runner, about 2 minutes inside the test
-      # window. Pulling the heavy ones in the background here overlaps them with Floci's start, the
-      # checkout and the test image build; a pull still running when a test needs the image is joined
+      # window. Pulling the heavy ones in the background here overlaps them with Floci's start and
+      # the test image build; a pull still running when a test needs the image is joined
       # by the daemon, not repeated. The list follows the "Pulling image:" lines of Floci's log; a
       # stale entry only costs a wasted pull, a missing one only the time it costs today.
       - name: Pre-pull service images
         if: matrix.test == 'sdk-test-java'
         run: |
+          NEPTUNE_IMAGE="$(bash .github/ci/service-image.sh neptune default-image)"
+          if [ -z "$NEPTUNE_IMAGE" ]; then
+            echo "::warning::Cannot read Neptune default-image from application.yml; skipping Neptune pre-pull"
+          fi
           for image in \
             opensearchproject/opensearch:2.19.5 opensearchproject/opensearch:2.11.1 \
             mysql:8.0 postgres:16.3-alpine postgres:16-alpine postgres:15-alpine \
             apache/flink:2.3 rabbitmq:3-management redpandadata/redpanda:latest \
-            tinkerpop/gremlin-server:3.7.3 influxdb:2.7 valkey/valkey:8 \
+            "$NEPTUNE_IMAGE" influxdb:2.7 valkey/valkey:8 \
             rancher/k3s:latest rancher/k3s:v1.29.14-k3s1 registry:2 \
             public.ecr.aws/lambda/python:3.12 public.ecr.aws/lambda/python:3.14 \
             public.ecr.aws/lambda/nodejs:20 public.ecr.aws/lambda/provided:al2023 \
             floci/floci-duck:latest floci/floci-sidecar-cedar:1.1.0 floci/floci-sidecar-graphql:0.2.0 \
             nginx:alpine nginx:latest alpine:3 alpine:latest busybox:stable busybox:latest; do
+            [ -n "$image" ] || continue
             nohup bash -c '
               start=$SECONDS
               if err=$(docker pull -q "$1" 2>&1 >/dev/null); then result=ok; else result=FAILED; fi
@@ -404,12 +418,26 @@ jobs:
           docker logs --tail 50 floci
           exit 1
 
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          sparse-checkout: |
-            compatibility-tests
-            .github/ci
+      # Keep the first Neptune request inside its existing test deadline on a cold runner.
+      - name: Pre-pull Neptune image for Node SDK
+        if: matrix.test == 'sdk-test-node'
+        run: |
+          image="$(bash .github/ci/service-image.sh neptune default-image)"
+          if [ -z "$image" ]; then
+            echo "::error::Cannot read Neptune default-image from application.yml"
+            exit 1
+          fi
+          for attempt in 1 2 3; do
+            if docker pull "$image"; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::Neptune image pre-pull failed (attempt $attempt/3): $image"
+              sleep 5
+            fi
+          done
+          echo "::error::Neptune image pre-pull failed after 3 attempts: $image"
+          exit 1
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 

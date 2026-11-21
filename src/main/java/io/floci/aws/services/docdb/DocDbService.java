@@ -6,17 +6,20 @@ import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.BackupWindows;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.docdb.container.DocDbContainerHandle;
 import io.floci.aws.services.docdb.container.DocDbContainerManager;
 import io.floci.aws.services.docdb.model.DocDbCluster;
 import io.floci.aws.services.docdb.model.DocDbClusterSettings;
+import io.floci.aws.services.docdb.model.DocDbClusterSnapshot;
 import io.floci.aws.services.docdb.model.DocDbInstance;
 import io.floci.aws.services.docdb.model.DocDbInstanceSettings;
 import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.kms.model.KmsKey;
+import io.floci.aws.services.rds.RdsSecurityGroups;
 import io.floci.aws.services.rds.RdsService;
 import io.floci.aws.services.rds.model.DbClusterParameterGroup;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -54,6 +57,9 @@ public class DocDbService {
 
     private final StorageBackend<String, DocDbCluster> clusters;
     private final StorageBackend<String, DocDbInstance> instances;
+    private final StorageBackend<String, DocDbClusterSnapshot> snapshots;
+    /** Snapshot archives, keyed like the snapshot records they belong to. */
+    private final StorageBackend<String, String> snapshotData;
     private final EmulatorConfig config;
     private final RegionResolver regionResolver;
     private final DocDbContainerManager containerManager;
@@ -188,6 +194,10 @@ public class DocDbService {
                 new TypeReference<Map<String, DocDbCluster>>() {});
         this.instances = storageFactory.create("docdb", "docdb-instances.json",
                 new TypeReference<Map<String, DocDbInstance>>() {});
+        this.snapshots = storageFactory.create("docdb", "docdb-cluster-snapshots.json",
+                new TypeReference<Map<String, DocDbClusterSnapshot>>() {});
+        this.snapshotData = storageFactory.create("docdb", "docdb-cluster-snapshot-data.json",
+                new TypeReference<Map<String, String>>() {});
     }
 
     // ── Clusters ──────────────────────────────────────────────────────────────
@@ -275,6 +285,7 @@ public class DocDbService {
      * the family's default parameter group, the VPC's default security group, one day of backups
      * and windows clear of each other; on modify it keeps the cluster's.
      */
+
     private DocDbClusterSettings resolveClusterSettings(DocDbClusterSettings settings, DocDbCluster current,
                                                         String engineVersion, String region) {
         boolean create = current == null;
@@ -326,58 +337,28 @@ public class DocDbService {
             if (ec2Service == null) {
                 throw new IllegalStateException("DocDbService was built without an Ec2Service");
             }
-            for (String groupId : securityGroups) {
-                boolean known = ec2Service.describeSecurityGroups(region, List.of(groupId), List.of(), Map.of())
-                        .stream().anyMatch(sg -> groupId.equals(sg.getGroupId()));
-                if (!known) {
-                    throw new AwsException("InvalidParameterValue",
-                            "Invalid security group , groupId= " + groupId + ", groupName=.", 400);
-                }
-            }
+            RdsSecurityGroups.requireInVpc(ec2Service, region, securityGroups, null);
         } else if (create) {
-            securityGroups = List.of(Ec2Service.defaultSecurityGroupId(region));
+            securityGroups = List.of(resolveDefaultSecurityGroupId(ec2Service, region));
         }
         String kmsKeyArn = resolveKmsKeyArn(settings.kmsKeyId(), region);
-        String backup = settings.preferredBackupWindow();
-        String maintenance = settings.preferredMaintenanceWindow();
-        boolean backupGiven = backup != null;
-        boolean maintenanceGiven = maintenance != null;
-        if (create) {
-            if (!backupGiven) {
-                backup = maintenanceGiven && BackupWindows.overlap(BackupWindows.DEFAULT_BACKUP_WINDOW, maintenance)
-                        ? BackupWindows.backupWindowAfter(maintenance) : BackupWindows.DEFAULT_BACKUP_WINDOW;
-                if (maintenanceGiven && BackupWindows.overlap(backup, maintenance)) {
-                    // the given window leaves no daily half hour free
-                    throw new AwsException("InvalidParameterValue", "The specified maintenance window overlaps "
-                            + "all available default backup windows. Shrink the maintenance window or specify "
-                            + "a non-overlapping backup window.", 400);
-                }
-            }
-            if (!maintenanceGiven) {
-                maintenance = backupGiven && BackupWindows.overlap(backup, BackupWindows.DEFAULT_MAINTENANCE_WINDOW)
-                        ? BackupWindows.maintenanceWindowAfter(backup) : BackupWindows.DEFAULT_MAINTENANCE_WINDOW;
-                if (BackupWindows.overlap(backup, maintenance)) {
-                    throw new AwsException("InvalidParameterValue", "The specified backup window overlaps "
-                            + "all available default maintenance windows. Shrink the backup window or specify "
-                            + "a non-overlapping maintenance window.", 400);
-                }
-            }
-        } else {
-            if (!backupGiven) {
-                backup = current.getPreferredBackupWindow() != null
-                        ? current.getPreferredBackupWindow() : BackupWindows.DEFAULT_BACKUP_WINDOW;
-            }
-            if (!maintenanceGiven) {
-                maintenance = current.getPreferredMaintenanceWindow() != null
-                        ? current.getPreferredMaintenanceWindow() : BackupWindows.DEFAULT_MAINTENANCE_WINDOW;
-            }
-        }
-        if (BackupWindows.overlap(backup, maintenance)) {
-            throw BackupWindows.overlapping();
-        }
+        String[] windows = BackupWindows.effectiveWindows(create, settings.preferredBackupWindow(),
+                settings.preferredMaintenanceWindow(),
+                create ? null : current.getPreferredBackupWindow(),
+                create ? null : current.getPreferredMaintenanceWindow());
         return new DocDbClusterSettings(subnetGroup, parameterGroup, securityGroups,
                 settings.storageEncrypted(), kmsKeyArn, settings.backupRetentionPeriod(),
-                backup, maintenance, settings.deletionProtection());
+                windows[0], windows[1], settings.deletionProtection());
+    }
+
+    /** The security group a cluster's VPC security group ids fall back to: the service's
+     *  resolved default when it is up, the region's computed default otherwise. */
+    private static String resolveDefaultSecurityGroupId(Ec2Service ec2Service, String region) {
+        if (ec2Service == null) {
+            return Ec2Service.defaultSecurityGroupId(region);
+        }
+        String resolved = ec2Service.resolveDefaultSecurityGroupId(region);
+        return resolved != null ? resolved : Ec2Service.defaultSecurityGroupId(region);
     }
 
     /** The family of the group a cluster is on; a group deleted since is judged by nothing. */
@@ -490,7 +471,7 @@ public class DocDbService {
             changed = true;
         }
         if (cluster.getVpcSecurityGroupIds() == null || cluster.getVpcSecurityGroupIds().isEmpty()) {
-            cluster.setVpcSecurityGroupIds(List.of(Ec2Service.defaultSecurityGroupId(region)));
+            cluster.setVpcSecurityGroupIds(List.of(resolveDefaultSecurityGroupId(ec2Service, region)));
             changed = true;
         }
         if (cluster.getPreferredBackupWindow() == null) {
@@ -543,11 +524,6 @@ public class DocDbService {
         if (!requested.equalsIgnoreCase(stored)) {
             throw new AwsException(errorCode, message, 404);
         }
-    }
-
-    /** The region a record was created in, taken from its ARN; older records carry the default. */
-    private String regionOf(String arn) {
-        return AwsArnUtils.regionOrDefault(arn, regionResolver.getDefaultRegion());
     }
 
     /**
@@ -640,18 +616,282 @@ public class DocDbService {
                         "Cannot delete DocDB cluster " + id + " — it still has DB instances.", 400);
             }
 
-            cluster.setStatus("deleting");
-            clusters.put(key(region, id), cluster);
+            removeCluster(region, cluster);
+        }
+    }
 
-            if (cluster.getContainerId() != null) {
-                containerManager.stop(new DocDbContainerHandle(
-                        cluster.getContainerId(), id,
-                        cluster.getContainerHost(), cluster.getContainerPort()));
+    /** Stops a cluster's container and removes its record; the caller holds the cluster's lock. */
+    private void removeCluster(String region, DocDbCluster cluster) {
+        String id = cluster.getDbClusterIdentifier();
+        cluster.setStatus("deleting");
+        clusters.put(key(region, id), cluster);
+
+        if (cluster.getContainerId() != null) {
+            containerManager.stop(new DocDbContainerHandle(
+                    cluster.getContainerId(), id,
+                    cluster.getContainerHost(), cluster.getContainerPort()));
+        }
+
+        clusters.delete(key(region, id));
+        writeLocks.remove("cluster:" + key(region, id));
+        LOG.infov("DocDB cluster {0} deleted", id);
+    }
+
+    // ── Cluster snapshots ─────────────────────────────────────────────────────
+
+    /** What a snapshot or a point-in-time restore takes from a cluster: its data and master password. */
+    private record ClusterArchive(String data, String masterPassword) {}
+
+    /**
+     * Takes a manual snapshot: a {@code mongodump} archive of the cluster's MongoDB container,
+     * complete when this returns, so the snapshot is {@code available} straight away.
+     */
+    public DocDbClusterSnapshot createDbClusterSnapshot(String snapshotId, String clusterId,
+                                                        Map<String, String> tags) {
+        String region = regionResolver.getRegion();
+        requireIdentifier(snapshotId, "DBClusterSnapshotIdentifier");
+        DocDbCluster cluster = getDbCluster(clusterId, region);
+        synchronized (lockFor("snapshot:" + key(region, snapshotId))) {
+            if (snapshots.get(key(region, snapshotId)).isPresent()) {
+                throw new AwsException("DBClusterSnapshotAlreadyExistsFault",
+                        "Cannot create the cluster snapshot because one with the identifier "
+                        + snapshotId + " already exists.", 400);
             }
+            ClusterArchive archive = archiveOf(cluster);
+            DocDbClusterSnapshot snapshot = new DocDbClusterSnapshot();
+            snapshot.setDbClusterSnapshotIdentifier(snapshotId);
+            snapshot.setDbClusterIdentifier(clusterId);
+            snapshot.setDbClusterSnapshotArn(regionResolver.buildArn("rds", region, "cluster-snapshot:" + snapshotId));
+            snapshot.setStatus("available");
+            snapshot.setSnapshotType("manual");
+            snapshot.setEngineVersion(cluster.getEngineVersion());
+            snapshot.setMasterUsername(cluster.getMasterUsername());
+            snapshot.setMasterPassword(archive.masterPassword());
+            snapshot.setPort(cluster.getPort());
+            snapshot.setStorageEncrypted(cluster.isStorageEncrypted());
+            snapshot.setKmsKeyId(cluster.getKmsKeyId());
+            snapshot.setSnapshotCreateTime(Instant.now());
+            snapshot.setClusterCreateTime(cluster.getCreatedAt());
+            snapshot.setSizeBytes(archive.data().length() * 3L / 4L);
+            snapshot.setMetadataOnly(config.services().docdb().mock());
+            if (tags != null && !tags.isEmpty()) {
+                snapshot.setTags(new LinkedHashMap<>(tags));
+            }
+            snapshotData.put(key(region, snapshotId), archive.data());
+            snapshots.put(key(region, snapshotId), snapshot);
+            LOG.infov("DocDB cluster snapshot {0} of {1} created ({2} bytes)",
+                    snapshotId, clusterId, String.valueOf(snapshot.getSizeBytes()));
+            return snapshot;
+        }
+    }
 
-            clusters.delete(key(region, id));
-            writeLocks.remove("cluster:" + key(region, id));
-            LOG.infov("DocDB cluster {0} deleted", id);
+    /**
+     * The cluster's data and master password, read from its MongoDB container. A snapshot and a
+     * point-in-time restore both take them this way, with the same checks: the cluster has to be
+     * available and, outside mock mode, running a backend whose data can be read.
+     */
+    private ClusterArchive archiveOf(DocDbCluster cluster) {
+        String clusterId = cluster.getDbClusterIdentifier();
+        if (!"available".equals(cluster.getStatus())) {
+            throw new AwsException("InvalidDBClusterStateFault",
+                    "DB cluster " + clusterId + " is not available.", 400);
+        }
+        if (config.services().docdb().mock()) {
+            return new ClusterArchive("", null);
+        }
+        if (cluster.getContainerId() == null) {
+            throw new AwsException("InvalidDBClusterStateFault",
+                    "DB cluster " + clusterId + " has no running MongoDB backend to read.", 400);
+        }
+        try {
+            return new ClusterArchive(containerManager.dumpCluster(cluster.getContainerId()),
+                    containerManager.masterPassword(cluster.getContainerId()));
+        } catch (RuntimeException e) {
+            LOG.warnv(e, "Failed to read the data of DocDB cluster {0}", clusterId);
+            throw new AwsException("InvalidDBClusterStateFault",
+                    "Failed to read the data of DB cluster " + clusterId + ": " + e.getMessage(), 400);
+        }
+    }
+
+    /**
+     * Whether a request's snapshot parameter, an identifier or an ARN, names a DocumentDB snapshot
+     * in this region. An ARN matches only the record stored under that exact ARN.
+     */
+    public boolean hasClusterSnapshot(String snapshotIdOrArn, String region) {
+        if (snapshotIdOrArn == null || snapshotIdOrArn.isBlank()) {
+            return false;
+        }
+        if (!AwsArnUtils.isArn(snapshotIdOrArn)) {
+            return snapshots.get(key(region, snapshotIdOrArn)).isPresent();
+        }
+        String id = snapshotIdInArn(snapshotIdOrArn);
+        return id != null && snapshots.get(key(region, id))
+                .map(snapshot -> snapshotIdOrArn.equals(snapshot.getDbClusterSnapshotArn()))
+                .orElse(false);
+    }
+
+    /** The snapshot identifier an RDS cluster-snapshot ARN names, or null when it names none. */
+    private static String snapshotIdInArn(String arn) {
+        try {
+            AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+            String prefix = "cluster-snapshot:";
+            return "rds".equals(parsed.service()) && parsed.resource().startsWith(prefix)
+                    ? parsed.resource().substring(prefix.length()) : null;
+        } catch (IllegalArgumentException malformed) {
+            return null;
+        }
+    }
+
+    /** The snapshot a request names, by identifier or by ARN, in the caller's region. */
+    public DocDbClusterSnapshot getDbClusterSnapshot(String snapshotIdOrArn) {
+        String region = regionResolver.getRegion();
+        String id = snapshotIdOrArn;
+        if (AwsArnUtils.isArn(snapshotIdOrArn)) {
+            id = snapshotIdInArn(snapshotIdOrArn);
+            if (id == null) {
+                throw new AwsException("InvalidParameterValue",
+                        "Invalid DB cluster snapshot identifier: " + snapshotIdOrArn, 400);
+            }
+        }
+        String name = id;
+        DocDbClusterSnapshot snapshot = snapshots.get(key(region, id)).orElseThrow(() ->
+                new AwsException("DBClusterSnapshotNotFoundFault",
+                        "DBClusterSnapshot " + name + " not found.", 404));
+        // Storage is keyed by identifier alone, so an ARN of another region or account would
+        // otherwise resolve this caller's snapshot.
+        if (AwsArnUtils.isArn(snapshotIdOrArn) && !snapshotIdOrArn.equals(snapshot.getDbClusterSnapshotArn())) {
+            throw new AwsException("DBClusterSnapshotNotFoundFault",
+                    "DBClusterSnapshot " + snapshotIdOrArn + " not found.", 404);
+        }
+        return snapshot;
+    }
+
+    /** Snapshots in this region matching every one of the request's identifier, cluster and type. */
+    public List<DocDbClusterSnapshot> describeDbClusterSnapshots(String snapshotIdOrArn, String clusterId,
+                                                                 String snapshotType) {
+        List<DocDbClusterSnapshot> candidates = snapshotIdOrArn != null && !snapshotIdOrArn.isBlank()
+                ? List.of(getDbClusterSnapshot(snapshotIdOrArn))
+                : inRegion(snapshots, regionResolver.getRegion(), DocDbClusterSnapshot::getDbClusterSnapshotIdentifier);
+        return candidates.stream()
+                .filter(sn -> clusterId == null || clusterId.isBlank() || clusterId.equals(sn.getDbClusterIdentifier()))
+                .filter(sn -> snapshotType == null || snapshotType.isBlank() || snapshotType.equals(sn.getSnapshotType()))
+                .toList();
+    }
+
+    public DocDbClusterSnapshot deleteDbClusterSnapshot(String snapshotIdOrArn) {
+        String region = regionResolver.getRegion();
+        String snapshotId = getDbClusterSnapshot(snapshotIdOrArn).getDbClusterSnapshotIdentifier();
+        synchronized (lockFor("snapshot:" + key(region, snapshotId))) {
+            DocDbClusterSnapshot snapshot = getDbClusterSnapshot(snapshotIdOrArn);
+            snapshots.delete(key(region, snapshotId));
+            snapshotData.delete(key(region, snapshotId));
+            writeLocks.remove("snapshot:" + key(region, snapshotId));
+            snapshot.setStatus("deleted");
+            return snapshot;
+        }
+    }
+
+    /**
+     * A new cluster holding the snapshot's data. It has no instances, as on AWS: the caller adds
+     * them with CreateDBInstance. The snapshot's master user comes back with the data.
+     */
+    public DocDbCluster restoreDbClusterFromSnapshot(String clusterId, String snapshotIdOrArn, String engineVersion,
+                                                     DocDbClusterSettings settings, Map<String, String> tags) {
+        String region = regionResolver.getRegion();
+        String snapshotId = getDbClusterSnapshot(snapshotIdOrArn).getDbClusterSnapshotIdentifier();
+        DocDbClusterSnapshot snapshot;
+        String data;
+        // The record and its archive are read together under the lock delete takes, so a restore
+        // sees both or neither, and a snapshot whose archive is gone is refused before any cluster
+        // exists rather than restored as an empty one.
+        synchronized (lockFor("snapshot:" + key(region, snapshotId))) {
+            snapshot = getDbClusterSnapshot(snapshotIdOrArn);
+            data = snapshotData.get(key(region, snapshotId)).orElse(null);
+            boolean restorable = snapshot.isMetadataOnly()
+                    ? config.services().docdb().mock()
+                    : data != null && !data.isEmpty();
+            if (!restorable) {
+                throw new AwsException("InvalidDBClusterSnapshotStateFault",
+                        "DB cluster snapshot " + snapshotId + " has no data to restore.", 400);
+            }
+        }
+        String password = snapshot.getMasterPassword() != null ? snapshot.getMasterPassword()
+                : UUID.randomUUID().toString();
+        String version = engineVersion != null && !engineVersion.isBlank()
+                ? engineVersion : snapshot.getEngineVersion();
+        DocDbCluster cluster = createDbCluster(clusterId, version, snapshot.getMasterUsername(), password, false,
+                restoredFrom(settings, snapshot.isStorageEncrypted(), snapshot.getKmsKeyId(), true), tags);
+        loadInto(cluster, snapshot.isMetadataOnly() ? "" : data);
+        return cluster;
+    }
+
+    /**
+     * A new cluster holding the source's data as it is now, the latest restorable time. The data is
+     * read as a snapshot reads it, with the same checks and faults.
+     */
+    public DocDbCluster restoreDbClusterToPointInTime(String clusterId, String sourceClusterId,
+                                                      DocDbClusterSettings settings, Map<String, String> tags) {
+        DocDbCluster source = getDbCluster(sourceClusterId);
+        ClusterArchive archive = archiveOf(source);
+        String password = archive.masterPassword() != null ? archive.masterPassword()
+                : UUID.randomUUID().toString();
+        DocDbCluster cluster = createDbCluster(clusterId, source.getEngineVersion(), source.getMasterUsername(),
+                password, false, restoredFrom(settings, source.isStorageEncrypted(), source.getKmsKeyId(), false), tags);
+        loadInto(cluster, archive.data());
+        return cluster;
+    }
+
+    /**
+     * The settings a restore creates its cluster with. A restore request carries no
+     * {@code StorageEncrypted} of its own: the cluster takes its source's encryption and key unless
+     * the request names a key. A snapshot restore may encrypt an unencrypted snapshot that way, as
+     * the restore guide allows; a point-in-time restore may not, and a key named for an unencrypted
+     * source is refused by {@code validate}, as its reference has it.
+     */
+    private static DocDbClusterSettings restoredFrom(DocDbClusterSettings requested, boolean sourceEncrypted,
+                                                     String sourceKmsKeyId, boolean keyMayEncrypt) {
+        boolean keyNamed = requested.kmsKeyId() != null && !requested.kmsKeyId().isBlank();
+        String kmsKeyId = keyNamed ? requested.kmsKeyId() : (sourceEncrypted ? sourceKmsKeyId : null);
+        boolean encrypted = sourceEncrypted || (keyNamed && keyMayEncrypt);
+        return new DocDbClusterSettings(requested.dbSubnetGroupName(), requested.dbClusterParameterGroupName(),
+                requested.vpcSecurityGroupIds(), encrypted, kmsKeyId, requested.backupRetentionPeriod(),
+                requested.preferredBackupWindow(), requested.preferredMaintenanceWindow(),
+                requested.deletionProtection());
+    }
+
+    private void loadInto(DocDbCluster cluster, String data) {
+        if (config.services().docdb().mock() || data.isEmpty() || cluster.getContainerId() == null) {
+            return;
+        }
+        try {
+            containerManager.restoreCluster(cluster.getContainerId(), data);
+        } catch (RuntimeException e) {
+            try {
+                discardRestoredCluster(cluster.getDbClusterIdentifier());
+            } catch (RuntimeException cleanup) {
+                LOG.warnv(cleanup, "Could not remove DocDB cluster {0} after its failed restore",
+                        cluster.getDbClusterIdentifier());
+                e.addSuppressed(cleanup);
+            }
+            throw new AwsException("InvalidRestoreFault",
+                    "Failed to restore cluster " + cluster.getDbClusterIdentifier() + ": " + e.getMessage(), 400);
+        }
+    }
+
+    /**
+     * Removes a cluster this restore just created and could not load. It bypasses deletion
+     * protection, which the request may have asked for: the caller never received the cluster.
+     */
+    private void discardRestoredCluster(String id) {
+        String region = regionResolver.getRegion();
+        synchronized (lockFor("cluster:" + key(region, id))) {
+            findCluster(region, id).ifPresent(cluster -> removeCluster(region, cluster));
+        }
+    }
+
+    private static void requireIdentifier(String value, String name) {
+        if (value == null || value.isBlank()) {
+            throw new AwsException("InvalidParameterValue", name + " is required.", 400);
         }
     }
 
@@ -816,6 +1056,54 @@ public class DocDbService {
     private record TagTarget(String lockKey, Map<String, String> tags,
                              Consumer<Map<String, String>> save) {}
 
+    public Optional<String> findStoredSnapshotArn(String name, String region) {
+        String arn = AwsArnUtils.isArnFor(name, "rds") ? name
+                : regionResolver.buildArn("rds", region, "cluster-snapshot:" + name);
+        if (!AwsArnUtils.isArnFor(arn, "rds")) {
+            return Optional.empty();
+        }
+        AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+        if (!parsed.accountId().equals(regionResolver.getAccountId()) || !parsed.region().equals(region)
+                || !parsed.partition().equals(regionResolver.partitionForRegion(region))
+                || !parsed.resource().startsWith("cluster-snapshot:")) {
+            return Optional.empty();
+        }
+        return readTagResource(snapshots, arn, parsed.resource().substring("cluster-snapshot:".length()),
+                DocDbClusterSnapshot::getDbClusterSnapshotArn).map(DocDbClusterSnapshot::getDbClusterSnapshotArn);
+    }
+
+    /** Exact stored tags for IAM, without legacy-record migration or resource creation. */
+    public Optional<Map<String, String>> storedResourceTags(String resourceArn) {
+        if (!AwsArnUtils.isArnFor(resourceArn, "rds")) {
+            return Optional.empty();
+        }
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(resourceArn);
+        if (!regionResolver.partitionForRegion(arn.region()).equals(arn.partition())
+                || arn.resource().indexOf(':') < 0) {
+            return Optional.empty();
+        }
+        return Optional.ofNullable(resolveTagTarget(resourceArn, true))
+                .map(target -> new LinkedHashMap<>(target.tags()));
+    }
+
+    private <T> Optional<T> readTagResource(StorageBackend<String, T> store, String resourceArn,
+                                           String id, Function<T, String> identity) {
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(resourceArn);
+        for (String candidate : List.of(key(arn.region(), id), id)) {
+            Optional<T> found;
+            if (store instanceof AccountAwareStorageBackend<T> aware) {
+                found = aware.getForAccount(arn.accountId(), candidate)
+                        .or(() -> aware.getLegacyForAccount(arn.accountId(), candidate));
+            } else {
+                found = store.get(candidate);
+            }
+            if (found.isPresent()) {
+                return found.filter(value -> resourceArn.equals(identity.apply(value)));
+            }
+        }
+        return Optional.empty();
+    }
+
     public Map<String, String> listTagsForResource(String resourceName) {
         return Map.copyOf(resolveTagTarget(resourceName).tags());
     }
@@ -855,6 +1143,10 @@ public class DocDbService {
      * ARN naming another region would otherwise resolve this caller's cluster.
      */
     private TagTarget resolveTagTarget(String resourceName) {
+        return resolveTagTarget(resourceName, false);
+    }
+
+    private TagTarget resolveTagTarget(String resourceName, boolean storedOnly) {
         if (resourceName == null || resourceName.isBlank()) {
             throw new AwsException("InvalidParameterValue", "ResourceName is required.", 400);
         }
@@ -865,8 +1157,9 @@ public class DocDbService {
             throw new AwsException("InvalidParameterValue", "Invalid resource name:  " + resourceName, 400);
         }
         if (!"rds".equals(arn.service())
-                || !regionResolver.getRegion().equals(arn.region())
-                || !Objects.equals(regionResolver.getAccountId(), arn.accountId())) {
+                || !regionResolver.partitionForRegion(arn.region()).equals(arn.partition())
+                || !storedOnly && (!regionResolver.getRegion().equals(arn.region())
+                    || !Objects.equals(regionResolver.getAccountId(), arn.accountId()))) {
             // One message for both, which is what a live account answers.
             throw new AwsException("InvalidParameterValue",
                     "The specified resource name does not match an RDS resource in this region.", 400);
@@ -887,7 +1180,11 @@ public class DocDbService {
         // rather than through the routing that matches the whole ARN.
         return switch (type) {
             case "cluster" -> {
-                DocDbCluster cluster = getDbCluster(id);
+                DocDbCluster cluster = readTagResource(clusters, resourceName, id, DocDbCluster::getDbClusterArn)
+                        .orElseGet(() -> storedOnly ? null : getDbCluster(id));
+                if (cluster == null) {
+                    yield null;
+                }
                 requireArnNamesRecord(resourceName, cluster.getDbClusterArn(),
                         "DBClusterNotFoundFault", "DocDB cluster " + id + " not found.");
                 yield new TagTarget("cluster:" + key(id), cluster.getTags(), updated -> {
@@ -896,7 +1193,11 @@ public class DocDbService {
                 });
             }
             case "db" -> {
-                DocDbInstance instance = getDbInstance(id);
+                DocDbInstance instance = readTagResource(instances, resourceName, id, DocDbInstance::getDbInstanceArn)
+                        .orElseGet(() -> storedOnly ? null : getDbInstance(id));
+                if (instance == null) {
+                    yield null;
+                }
                 requireArnNamesRecord(resourceName, instance.getDbInstanceArn(),
                         "DBInstanceNotFound", "DocDB instance " + id + " not found.");
                 yield new TagTarget("instance:" + key(id), instance.getTags(), updated -> {
@@ -904,8 +1205,24 @@ public class DocDbService {
                     instances.put(key(id), instance);
                 });
             }
-            default -> throw new AwsException("InvalidParameterValue",
-                    "Tagging for resource type '" + type + "' is not yet implemented by Floci: " + resourceName, 400);
+            case "cluster-snapshot" -> {
+                if (!storedOnly) {
+                    throw new AwsException("InvalidParameterValue",
+                            "Tagging for resource type '" + type + "' is not yet implemented by Floci: " + resourceName, 400);
+                }
+                yield readTagResource(snapshots, resourceName, id, DocDbClusterSnapshot::getDbClusterSnapshotArn)
+                        .map(snapshot -> new TagTarget("snapshot:" + key(arn.region(), id), snapshot.getTags(), updated -> {
+                            snapshot.setTags(updated);
+                            snapshots.put(key(arn.region(), id), snapshot);
+                        })).orElse(null);
+            }
+            default -> {
+                if (storedOnly) {
+                    yield null;
+                }
+                throw new AwsException("InvalidParameterValue",
+                        "Tagging for resource type '" + type + "' is not yet implemented by Floci: " + resourceName, 400);
+            }
         };
     }
 }

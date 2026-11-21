@@ -275,6 +275,55 @@ class SnsServiceTest {
         assertSame(first.subscription(), second.subscription());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"", "{}", "{ }", "{\"color\":[\"blue\"]}", "{ \"color\": [\"red\"] }"})
+    void subscribeRejectsDifferentFilterPolicyWithoutMutatingExistingSubscription(String requestedPolicy) {
+        Topic topic = snsService.createTopic("filter-reuse", null, null, REGION);
+        String originalPolicy = "{\"color\":[\"red\"]}";
+        Subscription original = snsService.subscribe(topic.getTopicArn(), "sqs", "queue", REGION,
+                Map.of("FilterPolicy", originalPolicy));
+
+        AwsException error = assertThrows(AwsException.class, () -> snsService.subscribe(
+                topic.getTopicArn(), "sqs", "queue", REGION, Map.of("FilterPolicy", requestedPolicy)));
+
+        assertEquals("InvalidParameter", error.getErrorCode());
+        assertEquals(originalPolicy, original.getAttributes().get("FilterPolicy"));
+        assertSame(original, snsService.subscribe(topic.getTopicArn(), "sqs", "queue", REGION,
+                Map.of("FilterPolicy", originalPolicy)));
+    }
+
+    @Test
+    void subscribeRejectsChangedRawDeliveryAndKeepsExistingAttributes() {
+        Topic topic = snsService.createTopic("raw-reuse", null, null, REGION);
+        Subscription original = snsService.subscribe(topic.getTopicArn(), "sqs", "queue", REGION,
+                Map.of("RawMessageDelivery", "true", "FilterPolicy", "{\"color\":[\"red\"]}"));
+
+        AwsException error = assertThrows(AwsException.class, () -> snsService.subscribe(
+                topic.getTopicArn(), "sqs", "queue", REGION, Map.of("RawMessageDelivery", "false")));
+
+        assertEquals("InvalidParameter", error.getErrorCode());
+        assertEquals("true", original.getAttributes().get("RawMessageDelivery"));
+        assertSame(original, snsService.subscribe(topic.getTopicArn(), "sqs", "queue", REGION, Map.of()));
+        assertSame(original, snsService.subscribe(topic.getTopicArn(), "sqs", "queue", REGION,
+                Map.of("FilterPolicyScope", "MessageBody")));
+        assertNull(original.getAttributes().get("FilterPolicyScope"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "{}"})
+    void subscribeAcceptsExplicitDefaultsWithoutChangingSubscription(String policy) {
+        Topic topic = snsService.createTopic("default-reuse", null, null, REGION);
+        Subscription original = snsService.subscribe(topic.getTopicArn(), "sqs", "queue", REGION, Map.of());
+
+        assertSame(original, snsService.subscribe(topic.getTopicArn(), "sqs", "queue", REGION,
+                Map.of("RawMessageDelivery", "false", "FilterPolicy", policy)));
+        assertTrue(original.getAttributes().isEmpty());
+        assertThrows(AwsException.class, () -> snsService.subscribe(topic.getTopicArn(), "sqs", "queue", REGION,
+                Map.of("RawMessageDelivery", "true")));
+        assertThrows(AwsException.class, () -> snsService.subscribe(topic.getTopicArn(), "sqs", "queue", REGION,
+                Map.of("FilterPolicy", "{\"color\":[\"red\"]}")));
+    }
+
     @Test
     void subscribe_firehoseRequiresValidRoleArn() {
         Topic topic = snsService.createTopic("firehose-topic", null, null, REGION);
@@ -502,6 +551,24 @@ class SnsServiceTest {
     void publish_withPhoneNumber_returnsMessageId() {
         String messageId = snsService.publish(null, null, "+819012345678", "Hello phone!", null, null, REGION);
         assertNotNull(messageId);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"+1a234", "NAA+15551234567", "+44 7700900123", "+447777785494394394", "not-a-number",
+            "+0447700900123", "+", ""})
+    void publish_toPhoneNumberNotInE164Format_throwsInvalidParameter(String phoneNumber) {
+        AwsException e = assertThrows(AwsException.class, () ->
+                snsService.publish(null, null, phoneNumber, "Hello phone!", null, null, REGION));
+        assertEquals("InvalidParameter", e.getErrorCode());
+        assertEquals("Invalid parameter: PhoneNumber Reason: " + phoneNumber + " is not valid to publish to",
+                e.getMessage());
+        assertEquals(400, e.getHttpStatus());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"+447700900123", "+123456789012345"})
+    void publish_toE164PhoneNumber_returnsMessageId(String phoneNumber) {
+        assertNotNull(snsService.publish(null, null, phoneNumber, "Hello phone!", null, null, REGION));
     }
 
     @Test

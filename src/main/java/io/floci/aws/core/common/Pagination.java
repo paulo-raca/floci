@@ -142,8 +142,22 @@ public final class Pagination {
                                                   Integer maxResults, String nextToken,
                                                   int defaultPageSize, int maxResultsLimit, int maxTokenLength,
                                                   String errorCode, String namespace) {
+        return paginate(all, cursorOf, maxResults, nextToken, defaultPageSize, maxResultsLimit, maxTokenLength,
+                errorCode, namespace, false);
+    }
+
+    /**
+     * As above; when {@code tokenMustBeNonEmpty} is set, an empty token is refused instead of being
+     * read as the first page, for operations whose model gives the token a minimum length of 1.
+     */
+    public static <T> PaginatedResult<T> paginate(List<T> all, Function<T, String> cursorOf,
+                                                  Integer maxResults, String nextToken,
+                                                  int defaultPageSize, int maxResultsLimit, int maxTokenLength,
+                                                  String errorCode, String namespace, boolean tokenMustBeNonEmpty) {
         validatePageSizeAndToken(maxResults, nextToken, maxResultsLimit, maxTokenLength, errorCode,
-                false, "Pagination token must not exceed " + maxTokenLength + " characters.");
+                tokenMustBeNonEmpty, nextToken != null && nextToken.isEmpty()
+                        ? tokenRangeMessage(maxTokenLength)
+                        : "Pagination token must not exceed " + maxTokenLength + " characters.");
         return paginate(all, cursorOf, maxResults == null ? defaultPageSize : maxResults, nextToken, namespace,
                 token -> new AwsException(errorCode, "Invalid pagination token.", 400));
     }
@@ -158,7 +172,7 @@ public final class Pagination {
                                                             int defaultPageSize, int maxResultsLimit,
                                                             int maxTokenLength, String errorCode) {
         validatePageSizeAndToken(maxResults, nextToken, maxResultsLimit, maxTokenLength, errorCode,
-                true, "Pagination token must be between 1 and " + maxTokenLength + " characters.");
+                true, tokenRangeMessage(maxTokenLength));
         int limit = maxResults == null ? defaultPageSize : maxResults;
         return slice(all, cursorOf, limit, nextToken, "", Function.identity());
     }
@@ -174,6 +188,10 @@ public final class Pagination {
                 && ((tokenMustBeNonEmpty && nextToken.isEmpty()) || nextToken.length() > maxTokenLength)) {
             throw new AwsException(errorCode, tokenErrorMessage, 400);
         }
+    }
+
+    private static String tokenRangeMessage(int maxTokenLength) {
+        return "Pagination token must be between 1 and " + maxTokenLength + " characters.";
     }
 
     /** Reads an optional JSON page size without coercing strings, fractions, or overflowing integers. */
@@ -230,13 +248,18 @@ public final class Pagination {
      * should produce.
      */
     public static Integer parseMaxResults(String value, String errorCode) {
+        return parseMaxResults(value, "maxResults", errorCode);
+    }
+
+    /** As above, naming {@code field} in the message for a page size that is not called {@code maxResults}. */
+    public static Integer parseMaxResults(String value, String field, String errorCode) {
         if (value == null || value.isBlank()) {
             return null;
         }
         try {
             return Integer.parseInt(value);
         } catch (NumberFormatException e) {
-            throw new AwsException(errorCode, "maxResults must be an integer.", 400);
+            throw new AwsException(errorCode, field + " must be an integer.", 400);
         }
     }
 

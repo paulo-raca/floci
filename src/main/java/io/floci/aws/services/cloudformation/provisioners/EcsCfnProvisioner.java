@@ -4,26 +4,34 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.services.cloudformation.model.StackResource;
+import io.floci.aws.services.ecs.EcsJsonHandler;
 import io.floci.aws.services.ecs.EcsService;
 import io.floci.aws.services.ecs.model.AwsVpcConfiguration;
+import io.floci.aws.services.ecs.model.CapacityProviderStrategyItem;
 import io.floci.aws.services.ecs.model.ClusterSetting;
 import io.floci.aws.services.ecs.model.ContainerDefinition;
+import io.floci.aws.services.ecs.model.CreateServiceRequest;
 import io.floci.aws.services.ecs.model.EcsCluster;
 import io.floci.aws.services.ecs.model.EcsLoadBalancer;
 import io.floci.aws.services.ecs.model.EcsServiceModel;
 import io.floci.aws.services.ecs.model.FirelensConfiguration;
+import io.floci.aws.services.ecs.model.HealthCheck;
 import io.floci.aws.services.ecs.model.KeyValuePair;
 import io.floci.aws.services.ecs.model.LaunchType;
 import io.floci.aws.services.ecs.model.LogConfiguration;
 import io.floci.aws.services.ecs.model.NetworkConfiguration;
 import io.floci.aws.services.ecs.model.NetworkMode;
 import io.floci.aws.services.ecs.model.PortMapping;
+import io.floci.aws.services.ecs.model.RegisterTaskDefinitionRequest;
+import io.floci.aws.services.ecs.model.RuntimePlatform;
 import io.floci.aws.services.ecs.model.Secret;
 import io.floci.aws.services.ecs.model.TaskDefinition;
+import io.floci.aws.services.ecs.model.UpdateServiceRequest;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -32,6 +40,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 /**
@@ -50,12 +59,20 @@ public class EcsCfnProvisioner implements CfnResourceProvisioner {
     private static final String SERVICE = "AWS::ECS::Service";
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final TypeReference<List<ClusterSetting>> SETTINGS = new TypeReference<>() { };
+    private static final CfnApiShapeConverter.Rules API_SHAPE = new CfnApiShapeConverter.Rules(
+            Map.of("EFSVolumeConfiguration", "efsVolumeConfiguration",
+                    "FSxWindowsFileServerVolumeConfiguration", "fsxWindowsFileServerVolumeConfiguration",
+                    "S3FilesVolumeConfiguration", "s3filesVolumeConfiguration",
+                    "FilesystemId", "fileSystemId", "IAM", "iam"),
+            Set.of("DriverOpts", "Labels"), Set.of("TransitEncryptionPort"), false);
 
     private final EcsService ecsService;
+    private final EcsJsonHandler ecsJsonHandler;
 
     @Inject
-    public EcsCfnProvisioner(EcsService ecsService) {
+    public EcsCfnProvisioner(EcsService ecsService, EcsJsonHandler ecsJsonHandler) {
         this.ecsService = ecsService;
+        this.ecsJsonHandler = ecsJsonHandler;
     }
 
     @Override
@@ -252,16 +269,21 @@ public class EcsCfnProvisioner implements CfnResourceProvisioner {
         if (family == null || family.isBlank()) {
             family = ctx.generatePhysicalName(r.getLogicalId(), 255, false);
         }
-        List<ContainerDefinition> containerDefs = parseContainerDefinitions(props.get("ContainerDefinitions"), ctx);
-        NetworkMode networkMode = parseEnum(NetworkMode.class, ctx.resolveOptional(props, "NetworkMode"));
-        String cpu = ctx.resolveOptional(props, "Cpu");
-        String memory = ctx.resolveOptional(props, "Memory");
-        String taskRoleArn = ctx.resolveOptional(props, "TaskRoleArn");
-        String executionRoleArn = ctx.resolveOptional(props, "ExecutionRoleArn");
-        List<String> requiresCompatibilities = ctx.resolveStringList(props, "RequiresCompatibilities");
+        RegisterTaskDefinitionRequest request = new RegisterTaskDefinitionRequest();
+        request.setFamily(family);
+        request.setContainerDefinitions(parseContainerDefinitions(props.get("ContainerDefinitions"), ctx));
+        JsonNode volumes = props.path("Volumes");
+        request.setVolumes(ecsJsonHandler.parseVolumes(normalizeCfnEcsArray(volumes)));
+        EcsJsonHandler.validateMountSources(request.getContainerDefinitions(), request.getVolumes());
+        request.setNetworkMode(parseEnum(NetworkMode.class, ctx.resolveOptional(props, "NetworkMode")));
+        request.setCpu(ctx.resolveOptional(props, "Cpu"));
+        request.setMemory(ctx.resolveOptional(props, "Memory"));
+        request.setTaskRoleArn(ctx.resolveOptional(props, "TaskRoleArn"));
+        request.setExecutionRoleArn(ctx.resolveOptional(props, "ExecutionRoleArn"));
+        request.setRequiresCompatibilities(ctx.resolveStringList(props, "RequiresCompatibilities"));
+        request.setRuntimePlatform(parseRuntimePlatform(props.path("RuntimePlatform")));
 
-        TaskDefinition td = ecsService.registerTaskDefinition(family, containerDefs, networkMode, cpu, memory,
-                taskRoleArn, executionRoleArn, requiresCompatibilities, ctx.region());
+        TaskDefinition td = ecsService.registerTaskDefinition(request, ctx.region());
 
         r.setPhysicalId(td.getTaskDefinitionArn());
         r.getAttributes().put("TaskDefinitionArn", td.getTaskDefinitionArn());
@@ -275,17 +297,27 @@ public class EcsCfnProvisioner implements CfnResourceProvisioner {
      * displaced one deleted once the stack update commits, through the replacement cleanup. Either
      * way the resource completes only once the service is stable, as CloudFormation's does; an
      * in-place update that does not stabilize is put back on the prior configuration.
+     * {@code AWS::ECS::Service} has no vendored property types, so a value a {@code String}
+     * parameter gives arrives as text and is converted where ECS expects an integer or a boolean,
+     * as CloudFormation's handler converts it (measured).
      */
     private void provisionService(StackResource r, JsonNode props, ProvisionContext ctx) {
         String clusterRef = ctx.resolveOptional(props, "Cluster");
         String taskDefinition = ctx.resolveOptional(props, "TaskDefinition");
-        int desiredCount = parseDesiredCount(ctx.resolveOptional(props, "DesiredCount"));
+        Integer desiredCount = parseDesiredCount(ctx.resolveOptional(props, "DesiredCount"));
         LaunchType launchType = parseEnum(LaunchType.class, ctx.resolveOptional(props, "LaunchType"));
         List<EcsLoadBalancer> loadBalancers =
                 parseLoadBalancers(props != null ? props.get("LoadBalancers") : null, ctx);
         NetworkConfiguration networkConfiguration =
                 parseNetworkConfiguration(props != null ? props.get("NetworkConfiguration") : null, ctx);
+        Map<String, Object> deploymentConfiguration =
+                parseDeploymentConfiguration(props != null ? props.get("DeploymentConfiguration") : null, ctx);
+        List<CapacityProviderStrategyItem> capacityProviderStrategy =
+                parseCapacityProviderStrategy(props != null ? props.get("CapacityProviderStrategy") : null, ctx);
+        List<Map<String, Object>> serviceRegistries =
+                parseServiceRegistries(props != null ? props.get("ServiceRegistries") : null, ctx);
 
+        Set<String> dropped = ctx.droppedProperties(props);
         String priorName = r.getAttributes().get("Name");
         String serviceName = ctx.resolveOptional(props, "ServiceName");
         if (serviceName == null || serviceName.isBlank()) {
@@ -298,29 +330,71 @@ public class EcsCfnProvisioner implements CfnResourceProvisioner {
         EcsServiceModel svc;
         boolean inPlace = ctx.isUpdate() && serviceName.equals(priorName)
                 && clusterName(clusterRef).equals(clusterOfServiceArn(ctx.priorPhysicalId()));
-        // Read before updateService, which changes this same model in place.
-        EcsServiceModel prior = inPlace ? ecsService.serviceByArn(ctx.priorPhysicalId()) : null;
-        String priorTaskDefinition = prior != null ? prior.getTaskDefinition() : null;
-        Integer priorDesiredCount = prior != null ? prior.getDesiredCount() : null;
-        NetworkConfiguration priorNetworkConfiguration = prior != null ? prior.getNetworkConfiguration() : null;
+        UpdateServiceRequest restore;
+        boolean clearDeploymentConfiguration = false;
+        boolean restoreDeploymentConfiguration = false;
+        Map<String, Object> priorDeploymentConfiguration = null;
         if (inPlace) {
-            svc = ecsService.updateService(clusterRef, serviceName, taskDefinition,
-                    desiredCount, networkConfiguration, ctx.region());
+            UpdateServiceRequest update = new UpdateServiceRequest();
+            update.setCluster(clusterRef);
+            update.setService(serviceName);
+            update.setTaskDefinition(taskDefinition);
+            // A missing count is left out of the update, as AWS omits it, so the stored count stays.
+            update.setDesiredCount(desiredCount);
+            update.setNetworkConfiguration(networkConfiguration);
+            update.setDeploymentConfiguration(deploymentConfiguration);
+            // A dropped strategy or registries stay null, so the stored value stays; only a declared empty list clears it.
+            update.setCapacityProviderStrategy(capacityProviderStrategy);
+            update.setServiceRegistries(serviceRegistries);
+            clearDeploymentConfiguration = deploymentConfiguration == null
+                    && dropped.contains("DeploymentConfiguration");
+            // Built before updateService, which changes this same model in place.
+            EcsServiceModel prior = ecsService.serviceByArn(ctx.priorPhysicalId());
+            restore = restoreRequest(update, prior);
+            priorDeploymentConfiguration = prior == null ? null : prior.getDeploymentConfiguration();
+            restoreDeploymentConfiguration = prior != null
+                    && (deploymentConfiguration != null || clearDeploymentConfiguration);
+            svc = ecsService.updateService(update, ctx.region());
         } else {
-            svc = ecsService.createService(clusterRef, serviceName, taskDefinition,
-                    desiredCount, launchType, loadBalancers, networkConfiguration, ctx.region());
+            CreateServiceRequest create = new CreateServiceRequest();
+            create.setCluster(clusterRef);
+            create.setServiceName(serviceName);
+            create.setTaskDefinition(taskDefinition);
+            create.setDesiredCount(desiredCount != null ? desiredCount : 1);
+            create.setLaunchType(launchType);
+            create.setLoadBalancers(loadBalancers);
+            create.setNetworkConfiguration(networkConfiguration);
+            create.setDeploymentConfiguration(deploymentConfiguration);
+            create.setCapacityProviderStrategy(
+                    capacityProviderStrategy != null && capacityProviderStrategy.isEmpty() ? null : capacityProviderStrategy);
+            create.setServiceRegistries(serviceRegistries);
+            restore = null;
+            svc = ecsService.createService(create, ctx.region());
         }
 
         r.setPhysicalId(svc.getServiceArn());
         r.getAttributes().put("Name", svc.getServiceName());
         r.getAttributes().put("ServiceArn", svc.getServiceArn());
         if (inPlace) {
+            String service = serviceName;
+            boolean clearedDeploymentConfiguration = clearDeploymentConfiguration;
+            boolean restoredDeploymentConfiguration = restoreDeploymentConfiguration;
+            Map<String, Object> priorConfiguration = priorDeploymentConfiguration;
             try {
+                if (clearedDeploymentConfiguration) {
+                    ecsService.replaceServiceDeploymentConfiguration(clusterRef, service, null, ctx.region());
+                }
                 ecsService.awaitServiceStable(svc);
             } catch (RuntimeException failure) {
-                restoreInPlace(r, failure, () -> ecsService.awaitServiceStable(ecsService.updateService(clusterRef,
-                        svc.getServiceName(), priorTaskDefinition, priorDesiredCount, priorNetworkConfiguration,
-                        ctx.region())));
+                restoreInPlace(r, failure, () -> {
+                    EcsServiceModel restored = ecsService.updateService(restore, ctx.region());
+                    // After updateService, so the exact prior value, none included, is what stays.
+                    if (restoredDeploymentConfiguration) {
+                        ecsService.replaceServiceDeploymentConfiguration(
+                                clusterRef, service, priorConfiguration, ctx.region());
+                    }
+                    ecsService.awaitServiceStable(restored);
+                });
                 throw failure;
             }
         } else {
@@ -329,13 +403,42 @@ public class EcsCfnProvisioner implements CfnResourceProvisioner {
     }
 
     /**
-     * Puts a service updated in place back on the task definition, desired count and network
-     * configuration it had, when the update does not stabilize, and waits for the restored
-     * configuration to stabilize, as CloudFormation's rollback does. CloudFormationService restores
-     * the prior resource record and reports the rollback complete unless told otherwise, so without
-     * this the stack would claim a rollback while ECS still runs the failed configuration. A
-     * restore that fails or does not stabilize is attached to the original failure and recorded as
-     * a rollback failure.
+     * The update that puts {@code prior} back on what {@code update} changed: its task definition
+     * and network configuration, and each setting the update declared, the desired count among
+     * them. A capacity provider strategy or service registries the service did not have are put
+     * back empty, so a registry the update added is deregistered; a setting the update left
+     * unchanged is left unchanged again, so the restore rolls no deployment for registries nobody
+     * touched. The deployment configuration is not here: updateService cannot put back none, so
+     * the caller restores it exactly through replaceServiceDeploymentConfiguration.
+     */
+    private static UpdateServiceRequest restoreRequest(UpdateServiceRequest update, EcsServiceModel prior) {
+        UpdateServiceRequest restore = new UpdateServiceRequest();
+        restore.setCluster(update.getCluster());
+        restore.setService(update.getService());
+        if (prior == null) {
+            return restore;
+        }
+        restore.setTaskDefinition(prior.getTaskDefinition());
+        if (update.getDesiredCount() != null) {
+            restore.setDesiredCount(prior.getDesiredCount());
+        }
+        restore.setNetworkConfiguration(prior.getNetworkConfiguration());
+        if (update.getCapacityProviderStrategy() != null) {
+            restore.setCapacityProviderStrategy(Objects.requireNonNullElse(prior.getCapacityProviderStrategy(), List.of()));
+        }
+        if (update.getServiceRegistries() != null) {
+            restore.setServiceRegistries(Objects.requireNonNullElse(prior.getServiceRegistries(), List.of()));
+        }
+        return restore;
+    }
+
+    /**
+     * Puts a service updated in place back on the configuration {@link #restoreRequest} captured
+     * when the update does not stabilize, and waits for the restored configuration to stabilize,
+     * as CloudFormation's rollback does. CloudFormationService restores the prior resource record
+     * and reports the rollback complete unless told otherwise, so without this the stack would
+     * claim a rollback while ECS still runs the failed configuration. A restore that fails or does
+     * not stabilize is attached to the original failure and recorded as a rollback failure.
      */
     private void restoreInPlace(StackResource r, RuntimeException failure, Runnable restore) {
         try {
@@ -426,7 +529,7 @@ public class EcsCfnProvisioner implements CfnResourceProvisioner {
                 () -> ecsService.deleteService(cluster, name, true, region), "ServiceNotFoundException");
     }
 
-    private static List<ContainerDefinition> parseContainerDefinitions(JsonNode node, ProvisionContext ctx) {
+    private List<ContainerDefinition> parseContainerDefinitions(JsonNode node, ProvisionContext ctx) {
         List<ContainerDefinition> result = new ArrayList<>();
         if (node == null || node.isNull()) {
             return result;
@@ -450,6 +553,7 @@ public class EcsCfnProvisioner implements CfnResourceProvisioner {
                 def.setMemoryReservation(item.path("MemoryReservation").asInt());
             }
             def.setPortMappings(parsePortMappings(item.path("PortMappings")));
+            def.setMountPoints(ecsJsonHandler.parseMountPoints(normalizeCfnEcsArray(item.path("MountPoints"))));
             def.setEnvironment(parseEnvironment(item.path("Environment")));
             def.setSecrets(parseSecrets(item.path("Secrets")));
             def.setLogConfiguration(parseLogConfiguration(item.path("LogConfiguration")));
@@ -466,9 +570,46 @@ public class EcsCfnProvisioner implements CfnResourceProvisioner {
             if (item.path("EntryPoint").isArray()) {
                 def.setEntryPoint(toStringList(item.path("EntryPoint")));
             }
+            if (item.hasNonNull("User")) {
+                def.setUser(item.path("User").asText());
+            }
+            def.setHealthCheck(parseHealthCheck(item.path("HealthCheck")));
             result.add(def);
         }
         return result;
+    }
+
+    private static HealthCheck parseHealthCheck(JsonNode node) {
+        if (!node.isObject()) {
+            return null;
+        }
+        return new HealthCheck(toStringList(node.path("Command")), optionalInt(node, "Interval"),
+                optionalInt(node, "Timeout"), optionalInt(node, "Retries"), optionalInt(node, "StartPeriod"));
+    }
+
+    private static ArrayNode normalizeCfnEcsArray(JsonNode node) {
+        ArrayNode result = MAPPER.createArrayNode();
+        if (node != null && node.isArray()) {
+            node.forEach(item -> {
+                if (item.isObject()) {
+                    result.add(CfnApiShapeConverter.convert(item, API_SHAPE));
+                }
+            });
+        }
+        return result;
+    }
+
+    private static Integer optionalInt(JsonNode node, String member) {
+        return node.hasNonNull(member) ? node.path(member).asInt() : null;
+    }
+
+    private static RuntimePlatform parseRuntimePlatform(JsonNode node) {
+        String cpuArchitecture = node.path("CpuArchitecture").asText(null);
+        String operatingSystemFamily = node.path("OperatingSystemFamily").asText(null);
+        if (cpuArchitecture == null && operatingSystemFamily == null) {
+            return null;
+        }
+        return new RuntimePlatform(cpuArchitecture, operatingSystemFamily);
     }
 
     private static LogConfiguration parseLogConfiguration(JsonNode node) {
@@ -641,6 +782,108 @@ public class EcsCfnProvisioner implements CfnResourceProvisioner {
         return networkConfiguration;
     }
 
+    private static List<Map<String, Object>> parseServiceRegistries(JsonNode node, ProvisionContext ctx) {
+        JsonNode resolved = ctx.engine().resolveNode(node);
+        if (resolved == null || !resolved.isArray()) {
+            return null;
+        }
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (JsonNode item : resolved) {
+            // An entry that resolved to AWS::NoValue is not an object.
+            if (item.isObject()) {
+                Map<String, Object> registry = new LinkedHashMap<>();
+                putText(registry, "registryArn", item, "RegistryArn");
+                putInt(registry, "port", item, "Port");
+                putText(registry, "containerName", item, "ContainerName");
+                putInt(registry, "containerPort", item, "ContainerPort");
+                result.add(registry);
+            }
+        }
+        return result;
+    }
+
+    /** An empty list stays empty: an update clears the strategy with it, a create treats it as none. */
+    private static List<CapacityProviderStrategyItem> parseCapacityProviderStrategy(JsonNode node,
+                                                                                    ProvisionContext ctx) {
+        JsonNode resolved = ctx.engine().resolveNode(node);
+        if (resolved == null || !resolved.isArray()) {
+            return null;
+        }
+        List<CapacityProviderStrategyItem> result = new ArrayList<>();
+        for (JsonNode item : resolved) {
+            // An entry that resolved to AWS::NoValue is not an object.
+            if (item.isObject()) {
+                result.add(new CapacityProviderStrategyItem(item.path("CapacityProvider").asText(),
+                        item.path("Weight").asInt(0), item.path("Base").asInt(0)));
+            }
+        }
+        return result;
+    }
+
+    /**
+     * The members of a {@code DeploymentConfiguration} in the API's shape. Its canary, linear and
+     * lifecycle hook members are not forwarded.
+     */
+    private static Map<String, Object> parseDeploymentConfiguration(JsonNode node, ProvisionContext ctx) {
+        JsonNode resolved = ctx.engine().resolveNode(node);
+        if (resolved == null || !resolved.isObject()) {
+            return null;
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        putInt(result, "maximumPercent", resolved, "MaximumPercent");
+        putInt(result, "minimumHealthyPercent", resolved, "MinimumHealthyPercent");
+        JsonNode breaker = resolved.path("DeploymentCircuitBreaker");
+        if (breaker.isObject()) {
+            Map<String, Object> circuitBreaker = new LinkedHashMap<>();
+            putBoolean(circuitBreaker, "enable", breaker, "Enable");
+            putBoolean(circuitBreaker, "rollback", breaker, "Rollback");
+            putBoolean(circuitBreaker, "resetOnHealthyTask", breaker, "ResetOnHealthyTask");
+            JsonNode threshold = breaker.path("ThresholdConfiguration");
+            if (threshold.isObject()) {
+                Map<String, Object> thresholdConfiguration = new LinkedHashMap<>();
+                putText(thresholdConfiguration, "type", threshold, "Type");
+                putInt(thresholdConfiguration, "value", threshold, "Value");
+                circuitBreaker.put("thresholdConfiguration", thresholdConfiguration);
+            }
+            result.put("deploymentCircuitBreaker", circuitBreaker);
+        }
+        JsonNode alarms = resolved.path("Alarms");
+        if (alarms.isObject()) {
+            Map<String, Object> deploymentAlarms = new LinkedHashMap<>();
+            if (alarms.hasNonNull("AlarmNames")) {
+                // Read unresolved, so a list parameter is its items rather than their joined text,
+                // unless an intrinsic such as Fn::Select produced the member and only the resolved value holds it.
+                JsonNode names = ctx.engine().omitNoValue(node).path("Alarms").path("AlarmNames");
+                deploymentAlarms.put("alarmNames", ctx.engine().resolveStringList(
+                        names.isMissingNode() ? alarms.get("AlarmNames") : names));
+            }
+            putBoolean(deploymentAlarms, "enable", alarms, "Enable");
+            putBoolean(deploymentAlarms, "rollback", alarms, "Rollback");
+            result.put("alarms", deploymentAlarms);
+        }
+        putText(result, "strategy", resolved, "Strategy");
+        putInt(result, "bakeTimeInMinutes", resolved, "BakeTimeInMinutes");
+        return result;
+    }
+
+    private static void putText(Map<String, Object> target, String key, JsonNode source, String member) {
+        if (source.hasNonNull(member)) {
+            target.put(key, source.path(member).asText());
+        }
+    }
+
+    private static void putInt(Map<String, Object> target, String key, JsonNode source, String member) {
+        if (source.hasNonNull(member)) {
+            target.put(key, source.path(member).asInt());
+        }
+    }
+
+    private static void putBoolean(Map<String, Object> target, String key, JsonNode source, String member) {
+        if (source.hasNonNull(member)) {
+            target.put(key, Boolean.parseBoolean(source.path(member).asText().trim()));
+        }
+    }
+
     /** An absent or unknown enum value means "not set", as the switch arms treated it. */
     private static <E extends Enum<E>> E parseEnum(Class<E> type, String value) {
         if (value == null || value.isBlank()) {
@@ -654,10 +897,10 @@ public class EcsCfnProvisioner implements CfnResourceProvisioner {
         }
     }
 
-    /** DesiredCount defaults to 1 when absent; anything present has to be an integer. */
-    private static int parseDesiredCount(String value) {
+    /** An absent DesiredCount is null (1 at create, left out at update); anything present has to be an integer. */
+    private static Integer parseDesiredCount(String value) {
         if (value == null || value.isBlank()) {
-            return 1;
+            return null;
         }
         try {
             return Integer.parseInt(value.trim());

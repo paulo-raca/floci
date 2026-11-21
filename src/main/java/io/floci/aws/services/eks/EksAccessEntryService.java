@@ -214,7 +214,7 @@ public class EksAccessEntryService {
                             && tags.equals(previous.tags())) {
                         return previous;
                     }
-                    throw invalid("clientRequestToken was already used with different parameters");
+                    throw invalid(EksAddonService.TOKEN_REUSED);
                 }
             }
         }
@@ -305,6 +305,26 @@ public class EksAccessEntryService {
         return Optional.empty();
     }
 
+    /**
+     * The tags of the access entry of {@code cluster} in {@code account} whose ARN is {@code accessEntryArn}, read in
+     * place.
+     */
+    Optional<Map<String, String>> tagsInAccount(String account, Cluster cluster, String accessEntryArn) {
+        String prefix = prefix(cluster);
+        for (String key : entries.keys()) {
+            if (!key.startsWith(prefix)) {
+                continue;
+            }
+            Optional<Map<String, String>> tags = AccountAwareStorageBackend.readInAccount(entries, account, key)
+                    .filter(stored -> accessEntryArn.equals(stored.entry().accessEntryArn()))
+                    .map(stored -> stored.entry().tags());
+            if (tags.isPresent()) {
+                return tags;
+            }
+        }
+        return Optional.empty();
+    }
+
     private static String prefix(Cluster cluster) {
         // A recreated cluster must not inherit access entries or pagination tokens from its predecessor.
         return cluster.getArn() + "/" + Objects.toString(cluster.getCreatedAt()) + "/";
@@ -319,7 +339,7 @@ public class EksAccessEntryService {
         }
     }
 
-    private static int pageSize(Integer maxResults) {
+    static int pageSize(Integer maxResults) {
         int limit = maxResults == null ? 100 : maxResults;
         if (limit < 1 || limit > 100) {
             throw invalid("maxResults must be between 1 and 100");

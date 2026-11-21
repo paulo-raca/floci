@@ -9,9 +9,9 @@ import com.github.dockerjava.api.model.HostConfig;
 import io.floci.aws.services.ecs.model.EcsTask;
 import io.floci.aws.testing.DockerAvailability;
 import io.floci.aws.testing.RestAssuredJsonUtils;
+import io.floci.aws.testing.ScopedServiceSettingsProfile;
 import io.floci.aws.testing.TestImages;
 import io.quarkus.test.junit.QuarkusTest;
-import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterEach;
@@ -20,11 +20,13 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
+import static io.floci.aws.testing.EcsTaskWaits.awaitLastStatus;
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -36,27 +38,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * size of {@code /dev/shm} and the tmpfs mount, as ECS hands each of them to Docker.
  */
 @QuarkusTest
-@TestProfile(EcsLinuxParametersDockerIntegrationTest.DockerEcsProfile.class)
+@TestProfile(ScopedServiceSettingsProfile.class)
 class EcsLinuxParametersDockerIntegrationTest {
 
     private static final String REGION = "us-east-1";
     private static final String ECS_CT = "application/x-amz-json-1.1";
     private static final String ECS_TARGET = "AmazonEC2ContainerServiceV20141113.";
     private static final long MIB = 1024L * 1024L;
-
-    /**
-     * Real containers, with security-group enforcement back to its shipped default of off, and
-     * {@code /dev/null} the one host path a device may take, since devices are refused by default.
-     */
-    public static final class DockerEcsProfile implements QuarkusTestProfile {
-        @Override
-        public Map<String, String> getConfigOverrides() {
-            return Map.of("floci.services.ecs.mock", "false",
-                    "floci.network.security-group-enforcement.enabled", "false",
-                    "floci.services.ecs.host-volume-roots", "/dev/null",
-                    "floci.services.ecs.allow-privileged-containers", "true");
-        }
-    }
 
     @Inject
     EcsService ecsService;
@@ -119,7 +107,9 @@ class EcsLinuxParametersDockerIntegrationTest {
         EcsTask task = ecsService.runTask(clusterName, taskDefinitionArn, 1,
                 null, null, null, null, null, REGION).getFirst();
         taskArn = task.getTaskArn();
-        EcsTask described = ecsService.describeTasks(clusterName, List.of(taskArn), REGION).getFirst();
+        EcsTask described = awaitLastStatus(
+                () -> ecsService.describeTasks(clusterName, List.of(taskArn), REGION).getFirst(),
+                EcsTask::getLastStatus, Duration.ofMinutes(2), "RUNNING", "STOPPED");
         assertEquals("RUNNING", described.getLastStatus(), "the container must be up: " + described.getStoppedReason());
         String containerId = described.getContainers().getFirst().getRuntimeId();
 
@@ -166,7 +156,9 @@ class EcsLinuxParametersDockerIntegrationTest {
         EcsTask task = ecsService.runTask(clusterName, taskDefinitionArn, 1,
                 null, null, null, null, null, REGION).getFirst();
         taskArn = task.getTaskArn();
-        EcsTask described = ecsService.describeTasks(clusterName, List.of(taskArn), REGION).getFirst();
+        EcsTask described = awaitLastStatus(
+                () -> ecsService.describeTasks(clusterName, List.of(taskArn), REGION).getFirst(),
+                EcsTask::getLastStatus, Duration.ofMinutes(2), "RUNNING", "STOPPED");
         assertEquals("RUNNING", described.getLastStatus(), "the container must be up: " + described.getStoppedReason());
 
         String containerId = described.getContainers().getFirst().getRuntimeId();

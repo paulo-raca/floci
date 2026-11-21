@@ -30,6 +30,7 @@ import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -72,6 +73,7 @@ public class RdsDataService implements Resettable {
     private final ObjectMapper objectMapper;
     private final RdsDataConnectionFactory connectionFactory;
     private final Duration transactionTtl;
+    private final Clock clock;
     private final ConcurrentMap<String, TransactionContext> transactions = new ConcurrentHashMap<>();
     private final ScheduledExecutorService transactionCleanupExecutor;
     private final RdsBackendGate backendGate;
@@ -120,11 +122,25 @@ public class RdsDataService implements Resettable {
                    RdsBackendGate backendGate,
                    RdsBackendEndpointResolver backendEndpointResolver,
                    boolean databaseResumingExceptionEnabled) {
+        this(resourceResolver, secretsManagerService, objectMapper, connectionFactory, transactionTtl,
+                backendGate, backendEndpointResolver, databaseResumingExceptionEnabled, Clock.systemUTC());
+    }
+
+    RdsDataService(RdsDataResourceResolver resourceResolver,
+                   SecretsManagerService secretsManagerService,
+                   ObjectMapper objectMapper,
+                   RdsDataConnectionFactory connectionFactory,
+                   Duration transactionTtl,
+                   RdsBackendGate backendGate,
+                   RdsBackendEndpointResolver backendEndpointResolver,
+                   boolean databaseResumingExceptionEnabled,
+                   Clock clock) {
         this.resourceResolver = resourceResolver;
         this.secretsManagerService = secretsManagerService;
         this.objectMapper = objectMapper;
         this.connectionFactory = connectionFactory;
         this.transactionTtl = transactionTtl;
+        this.clock = clock;
         this.backendGate = backendGate;
         this.backendEndpointResolver = backendEndpointResolver;
         this.databaseResumingExceptionEnabled = databaseResumingExceptionEnabled;
@@ -174,6 +190,7 @@ public class RdsDataService implements Resettable {
     }
 
     public ObjectNode executeStatement(JsonNode request, String region) {
+        validateRequestDatabase(request);
         rejectUnsupportedOptions(request);
 
         String sql = requiredText(request, "sql");
@@ -189,6 +206,7 @@ public class RdsDataService implements Resettable {
     }
 
     public ObjectNode batchExecuteStatement(JsonNode request, String region) {
+        validateRequestDatabase(request);
         String sql = requiredText(request, "sql");
         List<Map<String, JsonNode>> parameterSets = parseParameterSets(request);
 
@@ -201,6 +219,7 @@ public class RdsDataService implements Resettable {
     }
 
     public ObjectNode beginTransaction(JsonNode request, String region) {
+        validateRequestDatabase(request);
         cleanupExpiredTransactions();
         String resourceArn = requiredText(request, "resourceArn");
         requiredText(request, "secretArn");
@@ -220,7 +239,8 @@ public class RdsDataService implements Resettable {
             connection.setAutoCommit(false);
             String transactionId = UUID.randomUUID().toString();
             transactions.put(transactionId, new TransactionContext(
-                    transactionId, connection, target.engine(), target.arn(), database, region, transactionTtl,
+                    transactionId, connection, target.engine(), target.arn(), database, region,
+                    clock.instant().plus(transactionTtl),
                     lease));
             leaseHandedOver = true;
 
@@ -307,7 +327,7 @@ public class RdsDataService implements Resettable {
                 requireActiveTransaction(transactionId, tx);
                 return work.execute(tx.connection, tx.engine);
             } finally {
-                tx.refresh(transactionTtl);
+                tx.expiresAt = clock.instant().plus(transactionTtl);
                 tx.lock.unlock();
             }
         }
@@ -682,13 +702,30 @@ public class RdsDataService implements Resettable {
 
     private String databaseName(JsonNode request, RdsDataResourceResolver.DatabaseTarget target) {
         String database = textOrNull(request, "database");
-        if (database != null && !database.isBlank()) {
+        if (database != null && !database.isEmpty()) {
             return database;
         }
         if (target.databaseName() != null && !target.databaseName().isBlank()) {
             return target.databaseName();
         }
         throw new AwsException("BadRequestException", "database is required.", 400);
+    }
+
+    /**
+     * Refuses a request's {@code database} longer than the model's {@code DbName} allows. Runs first, as
+     * AWS checks the request's shape before it looks up the resource. Any other name is the engine's to
+     * judge: {@link RdsDataConnectionFactory#buildUrl} encodes it so it cannot change the connection.
+     */
+    private static void validateRequestDatabase(JsonNode request) {
+        String database = textOrNull(request, "database");
+        // Only an absent or empty name means "the resource's"; one of spaces is checked like any other.
+        if (database == null || database.isEmpty()) {
+            return;
+        }
+        if (database.length() > RdsDataConnectionFactory.MAX_DATABASE_NAME_LENGTH) {
+            throw new AwsException("BadRequestException", "database must be at most "
+                    + RdsDataConnectionFactory.MAX_DATABASE_NAME_LENGTH + " characters.", 400);
+        }
     }
 
     private TransactionContext transaction(String transactionId) {
@@ -719,7 +756,7 @@ public class RdsDataService implements Resettable {
     }
 
     private void cleanupExpiredTransactions() {
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         transactions.forEach((id, tx) -> {
             if (tx.expiresAt.isBefore(now) && tx.lock.tryLock()) {
                 try {
@@ -887,7 +924,7 @@ public class RdsDataService implements Resettable {
 
         private TransactionContext(
                 String id, Connection connection, DatabaseEngine engine, String resourceArn,
-                String database, String region, Duration ttl, RdsBackendGate.Lease lease) {
+                String database, String region, Instant expiresAt, RdsBackendGate.Lease lease) {
             this.id = id;
             this.connection = connection;
             this.engine = engine;
@@ -895,11 +932,7 @@ public class RdsDataService implements Resettable {
             this.database = database;
             this.region = region;
             this.lease = lease;
-            refresh(ttl);
-        }
-
-        private void refresh(Duration ttl) {
-            this.expiresAt = Instant.now().plus(ttl);
+            this.expiresAt = expiresAt;
         }
 
         private void close() {

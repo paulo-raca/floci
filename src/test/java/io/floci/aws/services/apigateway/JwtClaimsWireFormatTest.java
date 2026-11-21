@@ -2,6 +2,7 @@ package io.floci.aws.services.apigateway;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.core.common.Base64Url;
+import io.floci.aws.services.apigatewayv2.proxy.HttpProxyInvoker;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -29,7 +30,7 @@ class JwtClaimsWireFormatTest {
                 null, new ObjectMapper(), null,
                 null, null, null, null, new ApiGatewayExecuteRouteContext(), null,
                 null, null
-        , null, null, null);
+        , null, null, null, new HttpProxyInvoker());
     }
 
     private static String unsignedToken(String claimsJson) {
@@ -63,6 +64,77 @@ class JwtClaimsWireFormatTest {
                 "null-valued claims are omitted, not rendered as \"null\"");
         assertEquals("{\"country\":\"JP\"}", claims.raw().get("address"),
                 "nested object claims fall back to JSON text");
+    }
+
+    @Test
+    void parsesStringAudienceAsSingleEntry() {
+        ApiGatewayExecuteController.JwtClaims claims = controller.parseJwtClaims(unsignedToken("""
+                {"sub": "u", "aud": "https://api.example.com"}
+                """));
+
+        assertNotNull(claims);
+        assertEquals(List.of("https://api.example.com"), claims.audiences());
+    }
+
+    @Test
+    void parsesArrayAudienceKeepingEveryEntry() {
+        // Auth0 issues this shape whenever the openid scope is requested.
+        ApiGatewayExecuteController.JwtClaims claims = controller.parseJwtClaims(unsignedToken("""
+                {"sub": "u", "aud": ["https://api.example.com", "https://tenant.auth0.com/userinfo"]}
+                """));
+
+        assertNotNull(claims);
+        assertEquals(List.of("https://api.example.com", "https://tenant.auth0.com/userinfo"),
+                claims.audiences());
+    }
+
+    @Test
+    void audienceMatches_arrayAudContainingConfiguredAudience_matches() {
+        ApiGatewayExecuteController.JwtClaims claims = controller.parseJwtClaims(unsignedToken("""
+                {"sub": "u", "aud": ["https://api.example.com", "https://tenant.auth0.com/userinfo"]}
+                """));
+
+        assertTrue(ApiGatewayExecuteController.audienceMatches(
+                List.of("https://api.example.com"), claims));
+    }
+
+    @Test
+    void audienceMatches_arrayAudWithoutConfiguredAudience_doesNotMatch() {
+        ApiGatewayExecuteController.JwtClaims claims = controller.parseJwtClaims(unsignedToken("""
+                {"sub": "u", "aud": ["https://other.example.com", "https://tenant.auth0.com/userinfo"]}
+                """));
+
+        assertFalse(ApiGatewayExecuteController.audienceMatches(
+                List.of("https://api.example.com"), claims));
+    }
+
+    @Test
+    void audienceMatches_cognitoAccessTokenClientId_matches() {
+        ApiGatewayExecuteController.JwtClaims claims = controller.parseJwtClaims(unsignedToken("""
+                {"sub": "u", "client_id": "app-client-123"}
+                """));
+
+        assertNotNull(claims);
+        assertEquals(List.of(), claims.audiences());
+        assertTrue(ApiGatewayExecuteController.audienceMatches(List.of("app-client-123"), claims));
+    }
+
+    @Test
+    void audienceMatches_mismatchedAudWithMatchingClientId_doesNotMatch() {
+        ApiGatewayExecuteController.JwtClaims claims = controller.parseJwtClaims(unsignedToken("""
+                {"sub": "u", "aud": ["other"], "client_id": "expected"}
+                """));
+
+        assertFalse(ApiGatewayExecuteController.audienceMatches(List.of("expected"), claims));
+    }
+
+    @Test
+    void audienceMatches_emptyAudArrayWithMatchingClientId_doesNotMatch() {
+        ApiGatewayExecuteController.JwtClaims claims = controller.parseJwtClaims(unsignedToken("""
+                {"sub": "u", "aud": [], "client_id": "expected"}
+                """));
+
+        assertFalse(ApiGatewayExecuteController.audienceMatches(List.of("expected"), claims));
     }
 
     @Test

@@ -3,6 +3,7 @@ package io.floci.aws.services.iam;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.core.common.VendoredResources;
+import jakarta.ws.rs.core.MultivaluedMap;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -38,7 +39,10 @@ import java.util.Set;
  *
  * <p>The file also lists, for each credential scope whose REST routes {@code aws/rest-routes.json} reads, the
  * actions the Service Reference gives no resource type ({@link #actsOnNoResourceType}): AWS authorizes them on
- * {@code *}, which is what Floci checks a REST request on until it reads the resources in its path.
+ * {@code *}, which is what Floci checks a REST request on until it reads the resources in its path. And it lists
+ * the operations of those scopes a request on whose route is checked as the action its HTTP method names
+ * ({@link #actionFor(String, String, String)}): API Gateway's management API is authorized as
+ * {@code apigateway:GET}, {@code apigateway:POST} and so on, and {@code TagResource} is a PUT in v1 and a POST in v2.
  *
  * <p>A missing or malformed resource is a build defect, not a runtime condition, so loading fails
  * with {@link IllegalStateException} rather than degrading to an empty map, which would silently put
@@ -63,10 +67,21 @@ public final class IamAuthorizedActions {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     /**
-     * The file: the action of each operation it names, keyed by {@code <namespace>:<Operation>}, and the actions of
-     * no resource type, as {@code <namespace>:<Action>} in lower case.
+     * The file: the action of each operation it names, keyed by {@code <namespace>:<Operation>}, the actions of
+     * no resource type, as {@code <namespace>:<Action>} in lower case, the operations authorized by method, as
+     * {@code <namespace>:<Operation>}, the action of an operation for a request of one model's route, keyed by
+     * {@code <namespace>:<Operation>@<model>}, the operations whose action a request parameter chooses, and the
+     * reference's spelling of an action named as its operation in another case.
      */
-    record Table(Map<String, String> actions, Set<String> withoutResourceTypes) {
+    record Table(Map<String, String> actions, Set<String> withoutResourceTypes, Set<String> byMethod,
+                 Map<String, String> byModel, Map<String, Versioned> versioned, Map<String, String> spellings) {
+    }
+
+    /**
+     * An operation whose action is one or another by whether its request names {@code parameter}: S3's GetObject is
+     * {@code s3:GetObject}, and {@code s3:GetObjectVersion} for a request naming a {@code versionId}.
+     */
+    record Versioned(String parameter, String without, String with) {
     }
 
     private static final class Holder {
@@ -86,7 +101,39 @@ public final class IamAuthorizedActions {
         if (KEPT_FOR_ITEM_CHECKS.contains(own)) {
             return own;
         }
-        return Holder.TABLE.actions().getOrDefault(own, own);
+        String renamed = Holder.TABLE.actions().get(own);
+        return renamed != null ? renamed : Holder.TABLE.spellings().getOrDefault(own, own);
+    }
+
+    /**
+     * As {@link #actionFor(String, String, String)}, for a request of the route of {@code model}'s operation carrying
+     * {@code query}: the action the file gives the operation for that model's requests (S3 Control's account-level
+     * GetPublicAccessBlock is {@code s3:GetAccountPublicAccessBlock}, S3's {@code s3:GetBucketPublicAccessBlock}), or
+     * the one its request's parameter chooses (a GetObject naming a {@code versionId} is {@code s3:GetObjectVersion}).
+     */
+    public static String actionFor(String namespace, String operation, String method, String model,
+                                   MultivaluedMap<String, String> query) {
+        String own = namespace + ":" + operation;
+        String byModel = model == null ? null : Holder.TABLE.byModel().get(own + "@" + model);
+        if (byModel != null) {
+            return byModel;
+        }
+        Versioned versioned = Holder.TABLE.versioned().get(own);
+        if (versioned != null) {
+            return query != null && query.containsKey(versioned.parameter()) ? versioned.with() : versioned.without();
+        }
+        return actionFor(namespace, operation, method);
+    }
+
+    /**
+     * The action AWS checks for a request of {@code method} on a route of {@code operation} under {@code namespace}:
+     * the one that method names, {@code <namespace>:<METHOD>}, for an operation the file lists as authorized by
+     * method, or else {@link #actionFor(String, String)}'s.
+     */
+    public static String actionFor(String namespace, String operation, String method) {
+        return Holder.TABLE.byMethod().contains(namespace + ":" + operation)
+                ? namespace + ":" + method.toUpperCase(Locale.ROOT)
+                : actionFor(namespace, operation);
     }
 
     /**
@@ -122,7 +169,81 @@ public final class IamAuthorizedActions {
                 actions.put(namespace.getKey() + ":" + operation.getKey(), action);
             });
         });
-        return new Table(Map.copyOf(actions), withoutResourceTypes(document.path("actionsWithoutResourceTypes")));
+        return new Table(Map.copyOf(actions), withoutResourceTypes(document.path("actionsWithoutResourceTypes")),
+                byMethod(document.path("authorizedByMethod")), byModel(document.path("authorizedByModel")),
+                versioned(document.path("versioned")), spellings(document.path("spellings")));
+    }
+
+    /** Each namespace's operations' actions for one model's requests, keyed {@code <namespace>:<Operation>@<model>}. */
+    private static Map<String, String> byModel(JsonNode namespaces) {
+        Map<String, String> found = new LinkedHashMap<>();
+        namespaces.properties().forEach(namespace -> namespace.getValue().properties().forEach(model ->
+                model.getValue().properties().forEach(operation -> found.put(
+                        namespace.getKey() + ":" + operation.getKey() + "@" + model.getKey(),
+                        actionOf(namespace.getKey(), operation.getKey(), operation.getValue())))));
+        return Map.copyOf(found);
+    }
+
+    /** Each namespace's operations whose action a request parameter chooses. */
+    private static Map<String, Versioned> versioned(JsonNode namespaces) {
+        Map<String, Versioned> found = new LinkedHashMap<>();
+        namespaces.properties().forEach(namespace -> namespace.getValue().properties().forEach(operation -> {
+            JsonNode choice = operation.getValue();
+            if (!choice.path("parameter").isTextual() || choice.path("parameter").asText().isEmpty()) {
+                throw new IllegalStateException(RESOURCE_NAME + " gives " + namespace.getKey() + ":"
+                        + operation.getKey() + " a version choice naming no parameter");
+            }
+            found.put(namespace.getKey() + ":" + operation.getKey(), new Versioned(choice.path("parameter").asText(),
+                    actionOf(namespace.getKey(), operation.getKey(), choice.path("without")),
+                    actionOf(namespace.getKey(), operation.getKey(), choice.path("with"))));
+        }));
+        return Map.copyOf(found);
+    }
+
+    /** Each namespace's actions spelled otherwise than their operations, keyed {@code <namespace>:<Operation>}. */
+    private static Map<String, String> spellings(JsonNode namespaces) {
+        Map<String, String> found = new LinkedHashMap<>();
+        namespaces.properties().forEach(namespace -> namespace.getValue().properties().forEach(operation -> {
+            String action = actionOf(namespace.getKey(), operation.getKey(), operation.getValue());
+            if (!action.substring(namespace.getKey().length() + 1).equalsIgnoreCase(operation.getKey())) {
+                throw new IllegalStateException(RESOURCE_NAME + " spells " + namespace.getKey() + ":"
+                        + operation.getKey() + " as " + action + ", another name");
+            }
+            found.put(namespace.getKey() + ":" + operation.getKey(), action);
+        }));
+        return Map.copyOf(found);
+    }
+
+    /** The action a value names, refused unless it is one of the namespace's. */
+    private static String actionOf(String namespace, String operation, JsonNode value) {
+        String action = value.asText("");
+        if (!action.startsWith(namespace + ":") || action.length() == namespace.length() + 1) {
+            throw new IllegalStateException(RESOURCE_NAME + " maps " + namespace + ":" + operation + " to " + value
+                    + ", which is not an action of " + namespace);
+        }
+        return action;
+    }
+
+    /** The operations authorized by method, each scope's a list of operation names. */
+    private static Set<String> byMethod(JsonNode scopes) {
+        if (!scopes.isObject()) {
+            throw new IllegalStateException(RESOURCE_NAME + " carries no authorizedByMethod");
+        }
+        Set<String> operations = new HashSet<>();
+        scopes.properties().forEach(scope -> {
+            if (!scope.getValue().isArray()) {
+                throw new IllegalStateException(RESOURCE_NAME + " has authorizedByMethod."
+                        + scope.getKey() + " as something other than a list");
+            }
+            scope.getValue().forEach(operation -> {
+                if (!operation.isTextual() || operation.textValue().isBlank()) {
+                    throw new IllegalStateException(RESOURCE_NAME + " lists " + operation + " among "
+                            + scope.getKey() + "'s operations authorized by method");
+                }
+                operations.add(scope.getKey() + ":" + operation.textValue());
+            });
+        });
+        return Set.copyOf(operations);
     }
 
     /** The actions of no resource type, each scope's a list of action names. */

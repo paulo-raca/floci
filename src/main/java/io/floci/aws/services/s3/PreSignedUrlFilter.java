@@ -1,5 +1,6 @@
 package io.floci.aws.services.s3;
 
+import io.floci.aws.core.common.ResteasyRequests;
 import io.floci.aws.core.common.XmlBuilder;
 import io.floci.aws.core.common.auth.SigV4Canonicalization;
 import io.floci.aws.core.common.auth.SigV4RequestValidator;
@@ -32,13 +33,14 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
+import static io.floci.aws.core.common.auth.SigV4RequestValidator.LEGACY_ACCESS_KEY_ID;
+import static io.floci.aws.core.common.auth.SigV4RequestValidator.LEGACY_SECRET_KEY;
+
 @Provider
 @Priority(Priorities.AUTHENTICATION)
 public class PreSignedUrlFilter implements ContainerRequestFilter {
 
     private static final Logger LOG = Logger.getLogger(PreSignedUrlFilter.class);
-    private static final String LEGACY_ACCESS_KEY_ID = "test";
-    private static final String LEGACY_SECRET_KEY = "test";
     private static final Set<String> PRESIGNED_AUTH_SIGNALS = Set.of(
             "X-Amz-Algorithm",
             "X-Amz-Credential",
@@ -92,7 +94,7 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
             return;
         }
 
-        MultivaluedMap<String, String> queryParams = requestContext.getUriInfo().getQueryParameters();
+        MultivaluedMap<String, String> queryParams = ResteasyRequests.queryParameters(requestContext);
 
         boolean hasPresignedAuthSignal = false;
         for (String param : PRESIGNED_AUTH_SIGNALS) {
@@ -251,7 +253,7 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
     private boolean verifySigV4Signature(ContainerRequestContext requestContext,
                                         String signature, String secretKey) {
         try {
-            MultivaluedMap<String, String> queryParams = requestContext.getUriInfo().getQueryParameters();
+            MultivaluedMap<String, String> queryParams = ResteasyRequests.queryParameters(requestContext);
             String credential = queryParams.getFirst("X-Amz-Credential");
             String amzDate = queryParams.getFirst("X-Amz-Date");
             String signedHeaders = queryParams.getFirst("X-Amz-SignedHeaders");
