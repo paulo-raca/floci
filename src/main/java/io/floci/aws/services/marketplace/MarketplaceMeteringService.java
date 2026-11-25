@@ -40,6 +40,8 @@ import java.util.regex.Pattern;
 @ApplicationScoped
 public class MarketplaceMeteringService implements Resettable {
     private static final Pattern PRODUCT_CODE = Pattern.compile("[-a-zA-Z0-9/=:_.@]{1,255}");
+    /** Key prefix of the customers a test registered, apart from the region-keyed ones derived on demand. */
+    private static final String REGISTERED = "registered/";
     private static final KeyPair SIGNING_KEY = createSigningKey();
     private final ObjectMapper mapper;
     private final RequestContext context;
@@ -217,6 +219,10 @@ public class MarketplaceMeteringService implements Resettable {
             throw new AwsException("InvalidTokenException", "RegistrationToken is required.", 400);
         }
         String token = tokenNode.asText();
+        JsonNode registered = customerMappings.get(REGISTERED + token).orElse(null);
+        if (registered != null) {
+            return (ObjectNode) registered.deepCopy();
+        }
         JsonNode existing = customerMappings.get(region + "/" + token).orElse(null);
         if (existing != null) {
             return (ObjectNode) existing.deepCopy();
@@ -236,6 +242,51 @@ public class MarketplaceMeteringService implements Resettable {
         response.put("LicenseArn", AwsArnUtils.Arn.of("license-manager", region, customerAccount, "license:l-" + licenseId).toString());
         customerMappings.put(region + "/" + token, response);
         return response.deepCopy();
+    }
+
+    /**
+     * Registers the customer a registration token resolves to, in the calling account. AWS creates
+     * the token when a buyer subscribes, so this is a Floci extension that lets a test stand in for
+     * the buyer. {@code ResolveCustomer} returns the stored fields in any region.
+     */
+    synchronized ObjectNode registerCustomer(String registrationToken, JsonNode body) {
+        if (registrationToken == null || registrationToken.isBlank()) {
+            throw new AwsException("InvalidTokenException", "RegistrationToken is required.", 400);
+        }
+        if (body == null || !body.isObject()) {
+            throw validation("The customer must be an object.");
+        }
+        ObjectNode customer = mapper.createObjectNode();
+        for (String field : List.of("ProductCode", "CustomerAWSAccountId")) {
+            customer.put(field, requiredCustomerText(body, field));
+        }
+        for (String field : List.of("CustomerIdentifier", "LicenseArn")) {
+            if (body.hasNonNull(field)) {
+                customer.put(field, requiredCustomerText(body, field));
+            }
+        }
+        if (body.hasNonNull("Metadata")) {
+            customer.set("Metadata", body.get("Metadata").deepCopy());
+        }
+        customerMappings.put(REGISTERED + registrationToken, customer);
+        return customer.deepCopy();
+    }
+
+    /** Forgets the customers the calling account registered. */
+    synchronized void deleteRegisteredCustomers() {
+        for (String key : customerMappings.keys()) {
+            if (key.startsWith(REGISTERED)) {
+                customerMappings.delete(key);
+            }
+        }
+    }
+
+    private static String requiredCustomerText(JsonNode body, String field) {
+        JsonNode value = body.get(field);
+        if (value == null || !value.isTextual() || value.asText().isBlank()) {
+            throw validation(field + " is required and must be a non-empty string.");
+        }
+        return value.asText();
     }
 
     private String localProductCode(String region) {

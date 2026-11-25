@@ -19,6 +19,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 
 @ApplicationScoped
 public class MarketplaceEntitlementService implements Resettable {
@@ -83,6 +84,67 @@ public class MarketplaceEntitlementService implements Resettable {
             response.put("NextToken", Integer.toString(end));
         }
         return response;
+    }
+
+    /**
+     * Stores AWS-shaped entitlement records for the calling account. AWS has no write API for
+     * entitlements (the buyer's purchase creates them), so this is a Floci extension that lets a
+     * test stand in for that purchase. Every record is validated before any is stored.
+     */
+    synchronized List<JsonNode> addEntitlements(JsonNode body) {
+        List<JsonNode> records = new ArrayList<>();
+        if (body != null && body.isArray()) {
+            body.forEach(records::add);
+        } else if (body != null && !body.isNull()) {
+            records.add(body);
+        }
+        if (records.isEmpty()) {
+            throw invalid("At least one entitlement is required.");
+        }
+        for (JsonNode record : records) {
+            validateEntitlement(record);
+        }
+        List<JsonNode> stored = new ArrayList<>();
+        for (JsonNode record : records) {
+            String key = record.path("ProductCode").asText() + "/" + UUID.randomUUID();
+            entitlements.put(key, record.deepCopy());
+            stored.add(record.deepCopy());
+        }
+        return stored;
+    }
+
+    /** The calling account's entitlements, for one product or (null) for all of them. */
+    List<JsonNode> listEntitlements(String productCode) {
+        return entitlements.scan(key -> productCode == null || key.startsWith(productCode + "/"));
+    }
+
+    /** Removes the calling account's entitlements, for one product or (null) for all of them. */
+    synchronized void deleteEntitlements(String productCode) {
+        for (String key : entitlements.keys()) {
+            if (productCode == null || key.startsWith(productCode + "/")) {
+                entitlements.delete(key);
+            }
+        }
+    }
+
+    private void validateEntitlement(JsonNode record) {
+        if (record == null || !record.isObject()) {
+            throw invalid("An entitlement must be an object.");
+        }
+        requireText(record, "ProductCode", 1, 255);
+        if (!record.hasNonNull("CustomerIdentifier") && !record.hasNonNull("CustomerAWSAccountId")
+                && !record.hasNonNull("LicenseArn")) {
+            throw invalid("An entitlement needs a CustomerIdentifier, a CustomerAWSAccountId or a LicenseArn.");
+        }
+        for (String field : List.of("CustomerIdentifier", "CustomerAWSAccountId", "LicenseArn", "Dimension")) {
+            if (record.has(field) && !record.get(field).isNull()
+                    && (!record.get(field).isTextual() || record.get(field).asText().isBlank())) {
+                throw invalid(field + " must be a non-empty string.");
+            }
+        }
+        if (record.hasNonNull("ExpirationDate") && !record.get("ExpirationDate").isNumber()) {
+            throw invalid("ExpirationDate must be a number of epoch seconds.");
+        }
     }
 
     private void validateFilter(JsonNode filter) {

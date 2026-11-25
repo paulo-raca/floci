@@ -88,7 +88,7 @@ The API is served in the regions AWS publishes an endpoint for: `us-east-1`, `us
 
 ## Marketplace Entitlement
 
-AWS exposes this service as read-only: `GetEntitlements` is the only public operation. Floci therefore does not add a non-AWS mutation endpoint. Entitlement records are loaded from the shared `StorageFactory` backend (`marketplace-entitlements.json` in persistent mode), so tests and local environments can pre-seed AWS-shaped entitlement state while preserving account isolation.
+AWS exposes this service as read-only: `GetEntitlements` is the only public operation, and a buyer's purchase is what creates the entitlements. Entitlement records live in the shared `StorageFactory` backend (`marketplace-entitlements.json` in persistent mode), so a persistent environment can be pre-seeded with AWS-shaped state. A test that stands in for the buyer can instead store them at run time through the [seeding endpoints](#seeding-endpoints), which are Floci-only.
 
 `GetEntitlements` is served in the regions AWS publishes an endpoint for: `us-east-1`, `cn-northwest-1` and `eusc-de-east-1`. Requests signed for any other region are rejected with an `InvalidParameterException`.
 
@@ -108,6 +108,27 @@ Marketplace Reporting validates buyer dashboard requests and returns account-sco
 ## Marketplace Metering
 
 Metering records and idempotency state are persisted through `StorageFactory`, isolated by AWS account and region. `RegisterUsage` produces locally signed PS256 JWTs with an emulator-generated RSA key.
+
+`ResolveCustomer` answers a token no test has registered with a customer derived from the token, so the same token always resolves to the same customer. Registering the token through the [seeding endpoints](#seeding-endpoints) makes it resolve to the customer a test chooses.
+
+## Seeding endpoints
+
+AWS has no API to create the registration token a buyer's subscription produces or the entitlements it grants. These Floci-only endpoints stand in for the buyer, so a test of a SaaS seller can drive `ResolveCustomer` and `GetEntitlements`. Records belong to the account of the request's credentials (the default account without any), like every other Marketplace record, and `ResolveCustomer` and `GetEntitlements` must be called with credentials of the same account.
+
+| Endpoint | Description |
+|---|---|
+| `PUT /_aws/marketplace/customers/<registrationToken>` | The customer the token resolves to, in every region. Body: `ProductCode` and `CustomerAWSAccountId` are required, `CustomerIdentifier`, `LicenseArn` and `Metadata` optional. |
+| `DELETE /_aws/marketplace/customers` | Forgets the registered customers. |
+| `POST /_aws/marketplace/entitlements` | Stores an entitlement or a list of them, shaped as `GetEntitlements` returns them. Each needs a `ProductCode` and one of `CustomerIdentifier`, `CustomerAWSAccountId` or `LicenseArn`. `ExpirationDate` is epoch seconds. |
+| `GET /_aws/marketplace/entitlements[?ProductCode=X]` | Lists the stored entitlements. |
+| `DELETE /_aws/marketplace/entitlements[?ProductCode=X]` | Removes them. |
+
+```bash
+curl -X PUT localhost:4566/_aws/marketplace/customers/my-token \
+  -d '{"ProductCode":"prod-1","CustomerAWSAccountId":"123456789012","CustomerIdentifier":"customer-1"}'
+curl -X POST localhost:4566/_aws/marketplace/entitlements \
+  -d '{"ProductCode":"prod-1","CustomerIdentifier":"customer-1","Dimension":"users","ExpirationDate":1893456000}'
+```
 
 ## Marketplace Discovery
 
