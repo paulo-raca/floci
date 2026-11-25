@@ -67,6 +67,7 @@ import io.floci.aws.services.marketplace.MarketplaceCatalogController;
 import io.floci.aws.services.marketplace.MarketplaceDeploymentController;
 import io.floci.aws.services.marketplace.MarketplaceDiscoveryController;
 import io.floci.aws.services.marketplace.MarketplaceReportingController;
+import io.floci.aws.services.marketplace.MarketplaceSeedController;
 import io.floci.aws.services.msk.MskController;
 import io.floci.aws.services.mwaa.MwaaController;
 import io.floci.aws.services.oam.OamController;
@@ -882,7 +883,8 @@ public class ResolvedServiceCatalog {
                         "marketplace", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON, ServiceProtocol.JSON, ServiceProtocol.CBOR),
                         Set.of("AWSMPCommerceService_v20200301.", "AWSMPEntitlementService.", "AWSMPMeteringService."), Set.of("aws-marketplace"), Set.of("AWS Marketplace Entitlement Service"),
-                        Set.of(MarketplaceCatalogController.class, MarketplaceDeploymentController.class, MarketplaceReportingController.class, MarketplaceDiscoveryController.class)),
+                        Set.of(MarketplaceCatalogController.class, MarketplaceDeploymentController.class, MarketplaceReportingController.class, MarketplaceDiscoveryController.class,
+                                MarketplaceSeedController.class)),
                 descriptor("dms", "dms", config.services().dms().enabled(), true,
                         "dms", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
